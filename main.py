@@ -1994,6 +1994,36 @@ def alertas_html(limit: int = 50, cidade: str | None = None, auto_refresh: int =
 """
     return HTMLResponse(content=html, status_code=200)
 
+# ===== Debug do schema da tabela "alertas" (coloque DEPOIS do app/engine) =====
+from sqlalchemy import inspect
+
+@app.get("/debug/alertas_schema", tags=["Infra"])
+def debug_alertas_schema():
+    """
+    Lista apenas os nomes das colunas da tabela 'alertas' via SQLAlchemy Inspector.
+    """
+    insp = inspect(engine)
+    cols = [col["name"] for col in insp.get_columns("alertas")]
+    return {"columns": cols}
+
+@app.get("/debug/alertas_schema_raw", tags=["Infra"])
+def debug_alertas_schema_raw():
+    """
+    Fallback direto no SQLite: PRAGMA table_info(alertas).
+    Retorna nomes, tipos e flags de cada coluna.
+    """
+    with engine.connect() as conn:
+        rows = conn.exec_driver_sql("PRAGMA table_info(alertas);").fetchall()
+    # rows: (cid, name, type, notnull, dflt_value, pk)
+    columns = [r[1] for r in rows]
+    detail = [
+        {"name": r[1], "type": r[2], "notnull": r[3], "default": r[4], "pk": r[5]}
+        for r in rows
+    ]
+    return {"columns": columns, "detail": detail}
+# ============================================================================ 
+
+
 # ==== [cell] =============================================
 
 from typing import Optional, Literal
@@ -2384,12 +2414,4 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         "errors": errors
     }
 
-from sqlmodel import Session
-from sqlalchemy import inspect
-
-@app.get("/debug/alertas_schema")
-def debug_alertas_schema():
-    insp = inspect(engine)
-    cols = [col["name"] for col in insp.get_columns("alertas")]
-    return {"columns": cols}
 
