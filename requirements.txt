@@ -5,3 +5,4 @@ requests
 pandas
 pydantic
 python-multipart
+joblib>=1.3
