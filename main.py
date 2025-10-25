@@ -23,6 +23,11 @@ else:
 # Se estiver em Colab, isto instala os pacotes necessários.
 # Em outras máquinas, use: pip install -U sqlmodel "SQLAlchemy>=2" "pydantic>=2,<3" fastapi uvicorn[standard] requests pandas
 
+
+# Cria as tabelas no banco, se não existirem
+SQLModel.metadata.create_all(engine)
+# ==== [cell] =============================================
+
 import sys, subprocess, pkgutil
 
 def pip_install(pkgs):
