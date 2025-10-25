@@ -1386,14 +1386,63 @@ app.add_middleware(
 
 DEFAULT_LAT_f = DEFAULT_LAT
 DEFAULT_LON_f = DEFAULT_LON
+# ------------------------------------------------------------------------------
+# Variáveis globais do serviço (metadados e controle)
+# ------------------------------------------------------------------------------
+import os, time
+
+APP_NAME = os.getenv("APP_NAME", "AmazonSafe API")
+APP_VERSION = os.getenv("APP_VERSION", "v3")
+ENV = os.getenv("ENV", "development")
+
+# Marca o tempo em que a aplicação iniciou (para calcular uptime no /health)
+STARTED_AT = globals().get("_APP_STARTED_AT") or time.time()
+globals()["_APP_STARTED_AT"] = STARTED_AT
 
 # ------------------------------------------------------------------------------
 # Health
 # ------------------------------------------------------------------------------
 @app.get("/health", summary="Healthcheck e estatísticas de cache", tags=["Infra"])
 def health():
-    """Indica se o serviço está no ar e retorna um resumo do cache TTL em memória."""
-    return {"ok": True, "cache": cache_stats()}
+    """Indica se o serviço está no ar, mostra uptime e retorna resumo do cache."""
+    uptime_seconds = round(time.time() - STARTED_AT, 3)
+    return {
+        "ok": True,
+        "status": "healthy",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "env": ENV,
+        "uptime_seconds": uptime_seconds,
+        "cache": cache_stats(),
+    }
+# ------------------------------------------------------------------------------
+# Root (/): metadados e links úteis
+# ------------------------------------------------------------------------------
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.get("/", response_class=JSONResponse, summary="Index e metadados", tags=["Infra"])
+def root(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "env": ENV,
+        "docs": {
+            "openapi": f"{base}/openapi.json",
+            "swagger": f"{base}/docs",
+            "redoc": f"{base}/redoc",
+        },
+        "endpoints": {
+            "health": f"{base}/health",
+            "weather": f"{base}/api/weather?lat=-1.4558&lon=-48.5039",
+            "air_openaq": f"{base}/api/air/openaq?lat=-1.4558&lon=-48.5039&radius_m=10000",
+            "inpe_focos": f"{base}/api/inpe/focos?lat=-1.4558&lon=-48.5039&raio_km=150&scope=diario&region=Brasil&limit=200",
+            "data": f"{base}/api/data?cidade=Bel%C3%A9m%2C%20PA&raio_km=150&scope=diario&region=Brasil",
+        },
+    }
+
 
 # ------------------------------------------------------------------------------
 # Weather (Open-Meteo)
