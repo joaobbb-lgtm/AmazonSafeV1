@@ -2372,104 +2372,124 @@ def print_endpoints(base_url: str):
     print(f"Data (consolidado): {base}/api/data?cidade={cidade_q}&raio_km=150&scope=diario&region=Brasil")
     print(f"Alertas update (POST): {base}/api/alertas_update")
 
-# -----------------------------------------------------------
-# 1) Encerrar instâncias antigas (porta 8000 e túnel)
-# -----------------------------------------------------------
-# Em ambientes tipo Colab, 'fuser' e 'pkill' costumam estar disponíveis; ignore erros se não estiverem.
-_safe_run("fuser -k 8000/tcp || true")
-_safe_run("pkill -f 'cloudflared.*tunnel' || true")
+# ======== UTILIDADES LOCAIS (DESABILITADAS EM PRODUÇÃO/RENDER) ========
+# Importante:
+# - No Render, o comando de start já é: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+# - Não iniciar servidor/túnel/cron no import. Use somente em ambiente local quando quiser.
+
+
+# Ative estas ferramentas SOMENTE se definir RUN_LOCAL_STACK=1 no ambiente
+RUN_LOCAL = os.getenv("RUN_LOCAL_STACK") == "1"
 
 # -----------------------------------------------------------
-# 2) Subir o Uvicorn em thread
+# 1) Encerrar instâncias antigas (porta 8000 e túnel) — LOCAL
 # -----------------------------------------------------------
-nest_asyncio.apply()
+if RUN_LOCAL:
+    _safe_run("fuser -k 8000/tcp || true")
+    _safe_run("pkill -f 'cloudflared.*tunnel' || true")
 
+# -----------------------------------------------------------
+# 2) Subir o Uvicorn em thread — LOCAL
+# -----------------------------------------------------------
 def run_uvicorn():
-    # app deve existir (definido na célula 7)
-#     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")  # Comentado para deploy (Railway chama uvicorn externamente)
+    """Executa o uvicorn localmente (NÃO usado no Render)."""
+    pass  # Coloque o uvicorn.run(...) se realmente for usar localmente
 
-t = threading.Thread(target=run_uvicorn, daemon=True)
-t.start()
+if RUN_LOCAL:
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+    except Exception:
+        pass
 
-# Aguarda o /health local responder
-if _wait_http_ok("http://127.0.0.1:8000/health", tries=30, interval=1.0):
-    print("✅ Uvicorn pronto em http://127.0.0.1:8000")
-else:
-    print("⚠️ Uvicorn não respondeu em /health (localhost). Prosseguindo mesmo assim...")
+    # Se quiser rodar localmente, descomente a linha abaixo:
+    # import uvicorn
+    # def run_uvicorn():
+    #     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+    t = threading.Thread(target=run_uvicorn, daemon=True)
+    t.start()
+
+    # Aguarda o /health local responder (opcional)
+    if _wait_http_ok("http://127.0.0.1:8000/health", tries=30, interval=1.0):
+        print("✅ Uvicorn pronto em http://127.0.0.1:8000")
+    else:
+        print("⚠️ Uvicorn não respondeu em /health (localhost). Prosseguindo mesmo assim...")
 
 # -----------------------------------------------------------
-# 3) Instalar cloudflared (se necessário)
+# 3) Instalar cloudflared (se necessário) — LOCAL
 # -----------------------------------------------------------
-if not _have_cloudflared():
-    print("⏬ Instalando cloudflared...")
-    _safe_run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb")
-    _safe_run("dpkg -i cloudflared-linux-amd64.deb")
+def _have_cloudflared():
+    try:
+        out = subprocess.check_output(["which", "cloudflared"]).decode().strip()
+        return bool(out)
+    except Exception:
+        return False
+
+if RUN_LOCAL:
+    if not _have_cloudflared():
+        print("⏬ Instalando cloudflared...")
+        _safe_run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb")
+        _safe_run("dpkg -i cloudflared-linux-amd64.deb || true")
 
 # -----------------------------------------------------------
-# 4) Abrir túnel e capturar a URL pública
+# 4) Abrir túnel e capturar a URL pública — LOCAL
 # -----------------------------------------------------------
-log_path = "cloudflared.log"
-try:
-    if os.path.exists(log_path):
-        os.remove(log_path)
-except Exception:
-    pass
+def _open_cloudflared_tunnel():
+    log_path = "cloudflared.log"
+    try:
+        if os.path.exists(log_path):
+            os.remove(log_path)
+    except Exception:
+        pass
 
-proc = subprocess.Popen(
-    ["cloudflared", "tunnel", "--url", "http://127.0.0.1:8000", "--loglevel", "info", "--logfile", log_path],
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-)
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", "http://127.0.0.1:8000", "--loglevel", "info", "--logfile", log_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
 
-public_url = None
-pattern = re.compile(r"https://[a-zA-Z0-9\-\.]+\.trycloudflare\.com")
+    public_url = None
+    pattern = re.compile(r"https://[a-zA-Z0-9\-\.]+\.trycloudflare\.com")
 
-for _ in range(90):  # tenta por até ~90s
-    time.sleep(1)
-    if os.path.exists(log_path):
+    for _ in range(90):  # tenta por até ~90s
+        time.sleep(1)
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    m = pattern.search(f.read())
+                    if m:
+                        public_url = m.group(0)
+                        break
+            except Exception:
+                pass
+    return public_url, log_path
+
+if RUN_LOCAL:
+    public_url, log_path = _open_cloudflared_tunnel()
+
+    if public_url:
+        # Confere /health público só para feedback
+        if _wait_http_ok(public_url.rstrip("/") + "/health", tries=15, interval=1.0):
+            print_endpoints(public_url)
+        else:
+            print("⚠️ Túnel obtido, mas /health público não respondeu ainda.")
+            print_endpoints(public_url)
+    else:
+        print("❌ Não foi possível capturar a URL pública do Cloudflare. Veja o log abaixo:")
         try:
             with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-                m = pattern.search(f.read())
-                if m:
-                    public_url = m.group(0)
-                    break
-        except Exception:
-            pass
+                lines = f.read().splitlines()
+                print("\n".join(lines[-120:]))
+        except Exception as e:
+            print("Sem log disponível:", e)
 
-# -----------------------------------------------------------
-# 5) Imprimir endpoints (públicos e/ou locais)
-# -----------------------------------------------------------
-if public_url:
-    # Confere /health público só para feedback
-    if _wait_http_ok(public_url.rstrip("/") + "/health", tries=15, interval=1.0):
-        print_endpoints(public_url)
-    else:
-        print("⚠️ Túnel obtido, mas /health público não respondeu ainda.")
-        print_endpoints(public_url)
-else:
-    print("❌ Não foi possível capturar a URL pública do Cloudflare. Veja o log abaixo:")
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.read().splitlines()
-            print("\n".join(lines[-120:]))
-    except Exception as e:
-        print("Sem log disponível:", e)
-
-# Dica: se quiser iniciar o mini-cron quando o servidor estiver pronto (usando localhost),
-# chame:  start_mini_cron_when_ready(every_minutes=3, base_url="http://127.0.0.1:8000")
-# (A função precisa já estar definida na célula do mini-cron.)
-
-# ==== [cell] =============================================
-# ==== Mini-cron para /api/alertas_update ======================================
-import threading
-import time
-import requests
-from datetime import datetime
+# =================== MINI-CRON ===================
 
 MINI_CRON = {
     "thread": None,
     "stop_event": None,
     "interval_sec": 300,      # padrão: 5 min
-    "base_url": "http://127.0.0.1:8000",  # ajuste conforme seu túnel/servidor
+    "base_url": "http://127.0.0.1:8000",  # ajuste se necessário
     "timeout_sec": 20,
     "body": {
         "cidade": "Belém, PA",
@@ -2519,6 +2539,7 @@ def start_mini_cron(every_minutes: int = 5, base_url: str | None = None, body_ov
     MINI_CRON["stop_event"] = threading.Event()
     MINI_CRON["thread"] = threading.Thread(target=_cron_loop, daemon=True)
     MINI_CRON["thread"].start()
+
 def start_mini_cron_when_ready(
     every_minutes: int = 5,
     base_url: str = "http://127.0.0.1:8000",
@@ -2526,12 +2547,6 @@ def start_mini_cron_when_ready(
     tries: int = 30,
     interval_check_sec: float = 2.0
 ):
-    """
-    Aguarda /health responder 2xx e então chama start_mini_cron(...).
-    Se não ficar pronto dentro das tentativas, não inicia e avisa.
-    """
-    import time, requests
-
     url = base_url.rstrip("/") + "/health"
     print(f"[mini-cron] aguardando servidor: GET {url} (tries={tries}, interval={interval_check_sec}s)")
     ready = False
@@ -2550,7 +2565,6 @@ def start_mini_cron_when_ready(
         print("[mini-cron] servidor NÃO ficou pronto; mini-cron não será iniciado.")
         return
 
-    # servidor pronto -> inicia o cron normal
     start_mini_cron(every_minutes=every_minutes, base_url=base_url, body_override=body_override)
 
 def stop_mini_cron():
@@ -2563,27 +2577,13 @@ def stop_mini_cron():
     else:
         print("[mini-cron] não estava em execução.")
 
-# Exemplo:
-# start_mini_cron(every_minutes=3, base_url="https://seu-tunel.trycloudflare.com", body_override={"cidade":"Manaus, AM"})
-# ... depois:
-# stop_mini_cron()
-
-# ==== [cell] =============================================
-# ==== Start/Stop & Status do mini-cron ========================================
-
+# Helpers de controle (não executam nada automaticamente)
 def cron_start(every_minutes=3, base_url="http://127.0.0.1:8000", cidade="Belém, PA", **extra):
-    """
-    Sobe o mini-cron imediatamente (usa start_mini_cron).
-    Para esperar /health ficar OK, use cron_start_when_ready(...).
-    """
     body = {"cidade": cidade}
-    body.update(extra)  # ex.: scope="diario", region="Brasil", limit=300, weather_provider="open-meteo"
+    body.update(extra)
     start_mini_cron(every_minutes=every_minutes, base_url=base_url, body_override=body)
 
 def cron_start_when_ready(every_minutes=3, base_url="http://127.0.0.1:8000", cidade="Belém, PA", **extra):
-    """
-    Sobe o mini-cron apenas quando /health responder 2xx.
-    """
     body = {"cidade": cidade}
     body.update(extra)
     start_mini_cron_when_ready(every_minutes=every_minutes, base_url=base_url, body_override=body)
@@ -2601,117 +2601,9 @@ def cron_print_status():
     print(f"base_url: {MINI_CRON.get('base_url')}")
     print(f"body: {MINI_CRON.get('body')}")
 
-
-# ==== [cell] =============================================
-# iniciar direto (servidor já no ar)
-cron_start(every_minutes=3, base_url="http://127.0.0.1:8000", cidade="Belém, PA",
-           scope="diario", region="Brasil", limit=300, air_radius_m=10000, weather_provider="open-meteo")
-
-# OU esperar /health responder:
-# cron_start_when_ready(every_minutes=3, base_url="http://127.0.0.1:8000", cidade="Belém, PA")
-
-cron_print_status()
-
-# quando quiser parar:
-# cron_stop()
-# cron_print_status()
-
-# ==== [cell] =============================================
-# ==== Checker: health + leitura dos últimos alertas ===========================
-import os, json, requests
-
-def check_stack(base_url="http://127.0.0.1:8000", try_alertas=True, tail_ndjson=True, tail_n=5):
-    base_url = base_url.rstrip("/")
-    out = {}
-
-    # 1) /health
-    try:
-        r = requests.get(base_url + "/health", timeout=8)
-        out["health_status"] = r.status_code
-        out["health_json"] = r.json()
-    except Exception as e:
-        out["health_error"] = str(e)
-
-    # 2) /api/alertas (se disponível)
-    if try_alertas:
-        try:
-            r = requests.get(base_url + "/api/alertas", timeout=10)
-            out["alertas_status"] = r.status_code
-            out["alertas_len"] = len(r.json()) if r.headers.get("content-type","").startswith("application/json") else None
-        except Exception as e:
-            out["alertas_error"] = str(e)
-
-    # 3) tail no NDJSON (fallback do save_alert_score de exemplo)
-    if tail_ndjson:
-        ndjson = "/mnt/data/alerts/alerts.ndjson"
-        try:
-            if os.path.exists(ndjson):
-                with open(ndjson, "r", encoding="utf-8") as f:
-                    lines = f.readlines()[-tail_n:]
-                out["ndjson_tail"] = [json.loads(x) for x in lines if x.strip()]
-            else:
-                out["ndjson_tail"] = []
-        except Exception as e:
-            out["ndjson_error"] = str(e)
-
-    return out
-
-# Exemplo
-# check_stack("http://127.0.0.1:8000")
-
-# ==== [cell] =============================================
-# ==== Opcional: mini-cron multi-cidades =======================================
-def start_multi_city_cron(cities, every_minutes=5, base_url="http://127.0.0.1:8000", **common):
-    """
-    Roda um POST /api/alertas_update por cidade a cada ciclo.
-    'cities' pode ser lista de strings ["Belém, PA", "Manaus, AM"] ou
-    lista de dicts [{"cidade":"Belém, PA", "raio_km":200}, ...].
-    """
-    if MINI_CRON.get("thread") and MINI_CRON["thread"].is_alive():
-        print("[mini-cron] já está em execução.")
-        return
-
-    # monta corpo base a partir do MINI_CRON atual + 'common'
-    base = {**MINI_CRON["body"], **common}
-    if not isinstance(cities, (list, tuple)) or not cities:
-        raise ValueError("Passe uma lista de cidades.")
-
-    def _loop_multi():
-        url = base_url.rstrip("/") + "/api/alertas_update"
-        iv = max(30, int(every_minutes) * 60)
-        ev = threading.Event()
-        MINI_CRON["stop_event"] = ev
-        print(f"[mini-cron/multi] iniciado: {iv}s -> POST {url} cities={cities}")
-        idx = 0
-        while not ev.is_set():
-            t0 = time.time()
-            try:
-                item = cities[idx % len(cities)]
-                body = dict(base)
-                if isinstance(item, str):
-                    body["cidade"] = item
-                else:
-                    body.update(item)  # permite overrides específicos por cidade
-                r = requests.post(url, json=body, timeout=MINI_CRON["timeout_sec"])
-                ok = (200 <= r.status_code < 300)
-                print(f"[mini-cron/multi] {datetime.now().isoformat(timespec='seconds')} -> {body.get('cidade')} status={r.status_code}, ok={ok}")
-            except Exception as e:
-                print(f"[mini-cron/multi] {datetime.now().isoformat(timespec='seconds')} -> ERRO: {e}")
-            idx += 1
-            dt = time.time() - t0
-            wait_left = max(0.0, iv - dt)
-            if ev.wait(wait_left):
-                break
-        print("[mini-cron/multi] parado.")
-
-    MINI_CRON["thread"] = threading.Thread(target=_loop_multi, daemon=True)
-    MINI_CRON["thread"].start()
-
-# Exemplo:
-# start_multi_city_cron(
-#     cities=["Belém, PA", "Manaus, AM"],
-#     every_minutes=5, base_url="http://127.0.0.1:8000",
-#     scope="diario", region="Brasil", limit=300
-# )
-# ... depois: stop_mini_cron()
-
+# ===== NADA É EXECUTADO AUTOMATICAMENTE A PARTIR DAQUI =====
+# Se quiser usar localmente:
+#   export RUN_LOCAL_STACK=1
+#   python main.py   (ou rode células no seu ambiente)
+#
+# Em produção (Render), deixe RUN_LOCAL_STACK vazio/0. Apenas `app` é importado.
