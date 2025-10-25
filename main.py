@@ -82,6 +82,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict, Any, Tuple
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
+# === Grupo 2: Análise/IA ===
+from analytics.features import build_features
+from analytics.rules import classify_by_rules
+from analytics.model import predict, MODEL_VERSION
+
+# JSON rápido (orjson se disponível)
+import json
+try:
+    import orjson
+    _json_dumps = lambda obj: orjson.dumps(obj).decode("utf-8")
+except Exception:
+    _json_dumps = lambda obj: json.dumps(obj, ensure_ascii=False)
+
 # ===== Config de chaves/constantes =====
 # Coordenadas padrão (Belém)
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-1.4558"))
@@ -2260,6 +2273,56 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         )
         sr = compute_alert_score(alert_obs)
 
+        # ===== [GRUPO 2 — IA / análise de risco] =========================
+        # Usa os dados já coletados para construir features e classificar
+        try:
+            # monta um "obs" no formato esperado pelo analytics.features
+            obs_ai = {
+                "weather": (weather or {}).get("features") or {},
+                "air":     (air or {}).get("features") or {},
+                "inpe":    (focos or {}).get("features") or {},   # espera conter "count" e "focos"
+            }
+
+            # 1) features
+            feat = build_features(obs_ai)
+
+            # 2) baseline por regras
+            alerta_rules, pred_rules = classify_by_rules(feat)
+
+            # 3) tentativa com modelo treinado (se houver models/risk_rf.joblib)
+            pred = predict(feat)   # -> (label, {label:proba,...}) ou None
+            if pred:
+                alerta_final, proba = pred
+                pred_json = {
+                    "modelo": MODEL_VERSION,
+                    "proba": proba,
+                    "features": feat,
+                    "baseline": pred_rules,
+                }
+            else:
+                alerta_final = alerta_rules
+                pred_json = {
+                    "modelo": "rules_v1",
+                    "proba": pred_rules.get("p", {}),
+                    "features": feat,
+                }
+
+            # anexa no payload de score (vai aparecer na resposta)
+            score_payload["ai_alert"] = alerta_final
+            score_payload["ai_pred"]  = pred_json
+
+            # também guarda dentro do AlertObs enviado ao save_alert_score
+            # (útil para auditoria e para o front consumir)
+            try:
+                alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
+            except Exception:
+                pass
+
+        except Exception as _ai_err:
+            # não derruba o endpoint se der erro na IA
+            score_payload["ai_error"] = str(_ai_err)
+        # ===== [GRUPO 2 — fim] ============================================
+
         # defina um alert_id estável (pode ser por cidade ou por lat/lon)
         alert_id = (body.cidade or f"geo:{lat:.4f},{lon:.4f}").strip()
 
@@ -2293,21 +2356,40 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             # notify_on_bootstrap=False  # padrão
         )
 
-        score_payload = {
+        # **não sobrescrever** o que já foi colocado em score_payload (IA)
+        score_payload.update({
             "alert_id": alert_id,
             "score": sr.score,
             "level": sr.level,
             "breakdown": sr.breakdown,
             "alert_obs": alert_obs
-        }
+        })
+
         persisted["alert_score"] += 1
+
     except Exception as e:
         errors["alert_score"] = str(e)
 
     return {
         "ok": True,
-        "params": {"cidade": body.cidade, "lat": lat, "lon": lon, "resolve": meta_loc, "weather_provider": body.weather_provider},
+        "params": {
+            "cidade": body.cidade,
+            "lat": lat,
+            "lon": lon,
+            "resolve": meta_loc,
+            "weather_provider": body.weather_provider
+        },
         "persisted": persisted,
         "score": score_payload,
         "errors": errors
     }
+
+from sqlmodel import Session
+from sqlalchemy import inspect
+
+@app.get("/debug/alertas_schema")
+def debug_alertas_schema():
+    insp = inspect(engine)
+    cols = [col["name"] for col in insp.get_columns("alertas")]
+    return {"columns": cols}
+
