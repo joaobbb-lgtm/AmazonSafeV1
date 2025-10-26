@@ -1430,29 +1430,91 @@ def health():
         "cache": cache_stats(),
     }
 
-# ========= DEBUG: schema da tabela 'alertas' =========
-from sqlalchemy import inspect
+# ========= DEBUG: schema das tabelas =========
+from sqlalchemy import inspect, text
+
+@app.get("/debug/alertobs_schema", tags=["Infra"])
+def debug_alertobs_schema():
+    """Retorna os nomes das colunas da tabela 'alertobs' (se existir)."""
+    insp = inspect(engine)
+    try:
+        cols = [col["name"] for col in insp.get_columns("alertobs")]
+        return {"table": "alertobs", "columns": cols}
+    except Exception as e:
+        return {"table": "alertobs", "columns": [], "note": "Tabela não encontrada.", "error": str(e)}
 
 @app.get("/debug/alertas_schema", tags=["Infra"])
-def debug_alertas_schema():
-    """Retorna apenas os nomes das colunas da tabela 'alertas'."""
-    insp = inspect(engine)
-    cols = [col["name"] for col in insp.get_columns("alertas")]
-    return {"columns": cols}
-
-@app.get("/debug/alertas_schema_raw", tags=["Infra"])
-def debug_alertas_schema_raw():
-    """Fallback direto no SQLite via PRAGMA (nome, tipo, notnull, default, pk)."""
-    with engine.connect() as conn:
-        rows = conn.exec_driver_sql("PRAGMA table_info(alertas);").fetchall()
+def debug_alertas_schema_backward_compat():
+    """
+    Mantém a rota antiga, mas explica que a tabela correta é 'alertobs'.
+    Útil para quem ainda chama /debug/alertas_schema.
+    """
     return {
-        "columns": [r[1] for r in rows],
-        "detail": [
-            {"name": r[1], "type": r[2], "notnull": r[3], "default": r[4], "pk": r[5]}
-            for r in rows
-        ],
+        "note": "Não há tabela 'alertas' no schema atual. Use /debug/alertobs_schema.",
+        "tables_hint": ["weatherobs", "airobs", "fireobs", "alertobs"],
     }
-# =====================================================
+
+@app.get("/debug/tables", tags=["Infra"])
+def debug_tables():
+    """Lista tabelas existentes no banco."""
+    insp = inspect(engine)
+    return {"tables": insp.get_table_names()}
+
+@app.get("/debug/schema_raw/{table_name}", tags=["Infra"])
+def debug_schema_raw(table_name: str):
+    """PRAGMA direto no SQLite para qualquer tabela."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql(f"PRAGMA table_info({table_name});").fetchall()
+        return {
+            "table": table_name,
+            "columns": [r[1] for r in rows],
+            "detail": [
+                {"name": r[1], "type": r[2], "notnull": r[3], "default": r[4], "pk": r[5]}
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        return {"table": table_name, "columns": [], "detail": [], "error": str(e)}
+
+
+# ======[API] Último alerta gravado (para o dashboard) --------------------------
+
+
+def _read_last_ndjson(path: str) -> dict | None:
+    """Lê a ÚLTIMA linha válida de um arquivo NDJSON (retorna dict)."""
+    if not os.path.exists(path):
+        return None
+    last = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                last = json.loads(line)
+            except Exception:
+                continue
+    return last
+
+@app.get("/api/alertas", tags=["Alertas"], summary="Último alerta calculado (score/nível)")
+def api_alertas():
+    """
+    Retorna o último registro gravado por save_alert_score (se existir).
+    Estrutura padrão:
+      {
+        ts, alert_id, score, level,
+        alert_obs: { severity, duration, frequency, impact, meta: {...} },
+        params: {...}
+      }
+    """
+    path = "/mnt/data/alerts/alerts.ndjson"
+    rec = _read_last_ndjson(path)
+    if not rec:
+        return {"ok": True, "has_data": False, "note": "Nenhum alerta persistido ainda."}
+    return {"ok": True, "has_data": True, "data": rec}
+# -----------------------------------------------------------------------------
+
 
 # ------------------------------------------------------------------------------
 # Root (/): metadados e links úteis
