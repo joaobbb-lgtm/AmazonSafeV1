@@ -1256,9 +1256,9 @@ from datetime import datetime, timezone
 import math
 
 THRESHOLDS = {
-    "green_lt": 0.40,   # score < 0.40 => VERDE
-    "yellow_lt": 0.70,  # 0.40 <= score < 0.70 => AMARELO
-    # score >= 0.70 => VERMELHO
+    "green_lt": 0.33,   # score < 0.40 => VERDE
+    "yellow_lt": 0.66,  # 0.40 <= score < 0.70 => AMARELO
+    # score >= 0.66 => VERMELHO
 }
 
 WEIGHTS = {
