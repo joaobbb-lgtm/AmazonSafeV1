@@ -100,6 +100,45 @@ try:
 except Exception:
     _json_dumps = lambda obj: json.dumps(obj, ensure_ascii=False)
 
+# --- NDJSON de alertas (para Grupo 3/4 lerem sem SQL) ---
+
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+ALERTAS_NDJSON_PATH = os.path.join(DATA_DIR, "alertas.ndjson")
+
+def _utc_now_iso():
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _append_alerta_ndjson(alert_id: str, sr, alert_obs: dict):
+    """
+    Grava uma linha NDJSON com o último score/nível e alguns metadados úteis.
+    """
+    try:
+        meta = (alert_obs or {}).get("meta", {})
+        rec = {
+            "ts": _utc_now_iso(),
+            "alert_id": alert_id,
+            "score": round(sr.score, 3),
+            "level": sr.level,
+            # breakdown do score (se existir)
+            "severity": (sr.breakdown or {}).get("severity"),
+            "duration": (sr.breakdown or {}).get("duration"),
+            "frequency": (sr.breakdown or {}).get("frequency"),
+            "impact": (sr.breakdown or {}).get("impact"),
+            # alguns campos de meta para gráficos
+            "pm25": meta.get("pm25"),
+            "pm10": meta.get("pm10"),
+            "precipitation": meta.get("precipitation"),
+            "wind_speed_10m": meta.get("wind_speed_10m"),
+            "focos_count": meta.get("focos_count"),
+            "observed_at": meta.get("observed_at"),
+        }
+        with open(ALERTAS_NDJSON_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # não quebra o endpoint se falhar a escrita; apenas registra
+        print("[warn] append NDJSON:", e)
+
 # ===== Config de chaves/constantes =====
 # Coordenadas padrão (Belém)
 DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-1.4558"))
@@ -1477,6 +1516,19 @@ def debug_schema_raw(table_name: str):
     except Exception as e:
         return {"table": table_name, "columns": [], "detail": [], "error": str(e)}
 
+@app.get("/debug/ndjson_info", tags=["Infra"])
+def debug_ndjson_info():
+    try:
+        size = os.path.getsize(ALERTAS_NDJSON_PATH) if os.path.exists(ALERTAS_NDJSON_PATH) else 0
+        lines = 0
+        if size:
+            with open(ALERTAS_NDJSON_PATH, encoding="utf-8") as fh:
+                for _ in fh:
+                    lines += 1
+        return {"path": ALERTAS_NDJSON_PATH, "exists": os.path.exists(ALERTAS_NDJSON_PATH), "size_bytes": size, "lines": lines}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ======[API] Último alerta gravado (para o dashboard) --------------------------
 
@@ -1497,23 +1549,35 @@ def _read_last_ndjson(path: str) -> dict | None:
                 continue
     return last
 
-@app.get("/api/alertas", tags=["Alertas"], summary="Último alerta calculado (score/nível)")
-def api_alertas():
+@app.get("/api/alertas", tags=["Alertas"], summary="Lista alertas (NDJSON) recentes")
+def api_alertas(limit: int = 50, alert_id: Optional[str] = None):
     """
-    Retorna o último registro gravado por save_alert_score (se existir).
-    Estrutura padrão:
-      {
-        ts, alert_id, score, level,
-        alert_obs: { severity, duration, frequency, impact, meta: {...} },
-        params: {...}
-      }
+    Lê as últimas linhas do arquivo data/alertas.ndjson.
+    Use ?limit= e/ou ?alert_id= para filtrar.
     """
-    path = "/mnt/data/alerts/alerts.ndjson"
-    rec = _read_last_ndjson(path)
-    if not rec:
-        return {"ok": True, "has_data": False, "note": "Nenhum alerta persistido ainda."}
-    return {"ok": True, "has_data": True, "data": rec}
-# -----------------------------------------------------------------------------
+    try:
+        if not os.path.exists(ALERTAS_NDJSON_PATH):
+            return {"ok": True, "has_data": False, "note": "Nenhum alerta persistido ainda."}
+
+        rows: List[Dict] = []
+        with open(ALERTAS_NDJSON_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if alert_id and obj.get("alert_id") != alert_id:
+                    continue
+                rows.append(obj)
+
+        if not rows:
+            return {"ok": True, "has_data": False, "note": "Sem registros para o filtro atual."}
+
+        rows = rows[-max(1, min(limit, 500)):]  # segurança: máx 500
+        return {"ok": True, "count": len(rows), "items": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 
 
 # ------------------------------------------------------------------------------
@@ -2447,7 +2511,10 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             extra={"cidade": body.cidade, "lat": lat, "lon": lon}
             # notify_on_bootstrap=False  # padrão
         )
-
+        
+        # grava também no NDJSON
+        _append_alerta_ndjson(alert_id, sr, alert_obs)
+        
         # **não sobrescrever** o que já foi colocado em score_payload (IA)
         score_payload.update({
             "alert_id": alert_id,
