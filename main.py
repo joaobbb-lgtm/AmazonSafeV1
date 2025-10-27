@@ -11,13 +11,11 @@ from sqlmodel import create_engine, SQLModel
 
 # Fallback de banco: Railway Postgres -> SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-if DATABASE_URL:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-else:
-    engine = create_engine("sqlite:///./amazonsafe.db")
+DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
+engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # Garantir create_all no startup do FastAPI (se os modelos já estiverem definidos quando app subir)
-# Dica: defina @app.on_event("startup") no seu código principal para chamar SQLModel.metadata.create_all(engine)
+# Dica: defina @app.on_event("startup") no seu código principal para chamar
 # ==== [cell] =============================================
 # @title Setup de dependências (Colab/Notebook)
 # Se estiver em Colab, isto instala os pacotes necessários.
@@ -25,7 +23,6 @@ else:
 
 
 # Cria as tabelas no banco, se não existirem
-SQLModel.metadata.create_all(engine)
 # ==== [cell] =============================================
 
 import sys, subprocess, pkgutil
@@ -189,7 +186,7 @@ print("Config ok.",
 
 ## OpenWeatherMap - Config de chave
 # Aqui a chave já está fixa (para simplificar no Colab)
-OPENWEATHER_API_KEY = "3203ef417135f6dbd5a17a5c22167742"
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
 
 # ==== [cell] =============================================
@@ -223,7 +220,6 @@ def ttl_cache(ttl_seconds: int | None = None):
         wrapper._cache = store
         return wrapper
 
-    # <<< esta linha faltava >>>
     return deco
 
 
@@ -535,7 +531,7 @@ def _canonical_inpe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def inpe_focos_near(lat: float, lon: float, raio_km: int = 150, *,
+def inpe_focos_near_old(lat: float, lon: float, raio_km: int = 150, *,
                     scope: str | None = None, region: str | None = None,
                     limit: int = 1000, timeout: int = HTTP_TIMEOUT) -> Dict[str, Any]:
     """
@@ -617,7 +613,7 @@ def get_openweather(lat: float, lon: float, timeout: int = HTTP_TIMEOUT) -> dict
     Retorna o JSON bruto do OWM.
     """
     if not OPENWEATHER_API_KEY:
-        raise RuntimeError("OPENWEATHER_API_KEY não definido.")
+        return {}
     url = "https://api.openweathermap.org/data/2.5/weather"
     params = {
         "lat": lat,
@@ -993,8 +989,8 @@ from typing import Optional
 from sqlmodel import SQLModel, Field, create_engine
 import datetime as dt
 
-DB_URL = "sqlite:///awa.db"
-engine = create_engine(DB_URL, echo=False)
+DB_URL = DB_URL  # reuse global DB_URL
+# engine: reuse global engine
 
 UTC = dt.timezone.utc
 def _now_utc():
@@ -1056,7 +1052,6 @@ class FireObs(SQLModel, table=True):
     observed_at: dt.datetime = Field(default_factory=_now_utc)
 
 # Cria as tabelas (idempotente)
-SQLModel.metadata.create_all(engine)
 print("DB pronto: tabelas criadas/atualizadas em", DB_URL)
 
 # ==== [cell] =============================================
@@ -1554,6 +1549,14 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+
+
+@app.on_event("startup")
+def _on_startup():
+    try:
+except Exception:
+        pass
 
 DEFAULT_LAT_f = DEFAULT_LAT
 DEFAULT_LON_f = DEFAULT_LON
@@ -2275,6 +2278,22 @@ from fastapi import Query, Body, HTTPException
 from pydantic import BaseModel
 import math
 
+def safe_number(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def level_to_color(level: str) -> str:
+    lv = (level or "").strip().lower()
+    if lv.startswith("vermelh"):
+        return "#ef4444"
+    if lv.startswith("amarel"):
+        return "#eab308"
+    return "#22c55e"
+
+
+
 # -------------------------
 # Helpers locais
 # -------------------------
@@ -2638,9 +2657,19 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "alert_id": alert_id,
             "score": sr.score,
             "level": sr.level,
+
+            "level_color": level_to_color(sr.level),
             "breakdown": sr.breakdown,
             "alert_obs": alert_obs
         })
+
+        # Fallbacks leves p/ não deixar a análise em branco no front
+        score_payload.setdefault("ai_alert", {"label": "desconhecido"})
+        score_payload.setdefault("ai_pred", {"modelo": "none", "proba": {}, "features": {}})
+
+        # Status do KPI "água" (usa ar como proxy de disponibilidade)
+        air_features = (air or {}).get("features") or {}
+        score_payload["air_status"] = "ok" if air_features else "sem_estacao"
 
         persisted["alert_score"] += 1
 
@@ -2672,3 +2701,114 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     }
 
 
+
+
+
+def _collect_basics(lat: float, lon: float) -> dict:
+    """
+    Coleta clima (Open-Meteo e/ou OWM), qualidade do ar (OpenAQ) e focos (INPE).
+    Sempre retorna estrutura completa para evitar "análise em branco".
+    """
+    # Clima
+    try:
+        wx_om = normalize_open_meteo(get_open_meteo(lat, lon) or {})
+    except Exception:
+        wx_om = {}
+    try:
+        wx_owm_raw = get_openweather(lat, lon)
+        wx_owm = normalize_openweather(wx_owm_raw) if wx_owm_raw else {}
+    except Exception:
+        wx_owm = {}
+    weather = wx_owm or wx_om or {}
+
+    # Ar (OpenAQ)
+    air = {}
+    try:
+        locs = openaq_locations(lat, lon, radius_m=15000, limit=5)
+        results = (locs or {}).get("results") or []
+        if results:
+            best_id = results[0].get("id")
+            latest = openaq_latest_by_location_id(best_id)
+            sensors = openaq_sensors_by_location_id(best_id)
+            air = normalize_openaq_v3_latest(latest, sensors)
+    except Exception:
+        air = {}
+
+    # Focos (INPE)
+    focos = {"features": {"focos": [], "count": 0, "meta": {}}, "payload": {}}
+    try:
+        focos = inpe_focos_near(lat, lon, raio_km=150)
+    except Exception:
+        pass
+
+    return {"weather": weather, "air": air, "focos": focos}
+
+
+@app.get("/analise")
+def analise(cidade: str | None = Query(default=None), lat: float | None = None, lon: float | None = None):
+    """
+    Produz score/nível + blocos para KPIs.
+    Nunca retorna em branco: degrada com dados parciais quando necessário.
+    """
+    try:
+        if (lat is None or lon is None) and cidade:
+            g = geocode_city(cidade)
+            if g:
+                lat, lon = g["lat"], g["lon"]
+    except Exception:
+        pass
+    lat = lat if lat is not None else DEFAULT_LAT
+    lon = lon if lon is not None else DEFAULT_LON
+
+    data = _collect_basics(lat, lon)
+    weather, air = data.get("weather") or {}, data.get("air") or {}
+    score, level = score_risk(weather, air)
+    color = level_to_color(level)
+
+    # Persistência best-effort
+    try:
+        save_weather(lat, lon, weather, raw=weather)
+        save_air(lat, lon, "openaq", None, air, raw=air)
+        save_fire(lat, lon, "inpe_csv", payload=data.get("focos"))
+    except Exception:
+        pass
+
+    # Linha NDJSON “last state” (para gráficos do front)
+    try:
+        class _SR:
+            score = score
+            level = level
+            breakdown = None
+        _append_alerta_ndjson("global", _SR, {"meta": {
+            "pm25": air.get("pm25"),
+            "pm10": air.get("pm10"),
+            "precipitation": weather.get("precipitation"),
+            "wind_speed_10m": weather.get("wind_speed_10m"),
+            "observed_at": weather.get("observed_at"),
+            "focos_count": ((data.get("focos") or {}).get("features") or {}).get("count"),
+        }})
+    except Exception:
+        pass
+
+    # KPI Água (placeholder)
+    kpi_agua = {
+        "status": "indisponível",
+        "motivo": "Integração ANA não implementada/instável",
+        "level": "Amarelo",
+        "color": level_to_color("Amarelo"),
+        "dados": [],
+    }
+
+    return {
+        "ok": True,
+        "coords": {"lat": lat, "lon": lon},
+        "score": score,
+        "level": level,
+        "color": color,
+        "blocks": {
+            "weather": weather,
+            "air": air,
+            "fire": (data.get("focos") or {}).get("features") or {},
+            "agua": kpi_agua,
+        }
+    }
