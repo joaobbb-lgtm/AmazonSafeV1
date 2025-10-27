@@ -1555,8 +1555,14 @@ app.add_middleware(
 @app.on_event("startup")
 def _on_startup():
     try:
-except Exception:
+        # cria/atualiza as tabelas quando a API inicia
+        from sqlmodel import SQLModel
+        SQLModel.metadata.create_all(engine)
+    except Exception as e:
+        # não derruba o serviço caso o DB não esteja disponível no boot
+        print("DB init error:", e)
         pass
+
 
 DEFAULT_LAT_f = DEFAULT_LAT
 DEFAULT_LON_f = DEFAULT_LON
