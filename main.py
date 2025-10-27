@@ -1304,12 +1304,86 @@ def _hours_since(iso_str: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+
 def build_alert_obs(weather_features: Dict[str, Any],
                     air_features: Dict[str, Any],
                     fire_features: Dict[str, Any]) -> Dict[str, Any]:
-    # ... (cálculos acima)
-    focos = ((fire_features or {}).get("focos") or [])
+    """
+    Consolida as features (tempo/ar/fogo) em componentes de score:
+      - severity: poluição (PMs) normalizada
+      - duration: 'tempo seco' (horas desde a última chuva > 0)
+      - frequency: nº de focos (INPE) normalizado
+      - impact: vento (km/h) normalizado
+    """
+
+    # --- Leituras brutas
+    pm25 = (air_features or {}).get("pm25")
+    pm10 = (air_features or {}).get("pm10")
+    precip = (weather_features or {}).get("precipitation")
     wind = (weather_features or {}).get("wind_speed_10m")
+    observed_at = (weather_features or {}).get("observed_at")
+
+    focos = ((fire_features or {}).get("focos") or [])
+    focos_count = len(focos)
+
+    # --- 1) severity (0..1) pelos PMs
+    def _norm_pm(val: Optional[float], kind: str) -> float:
+        if val is None:
+            return 0.0
+        ref = 75.0 if kind == "pm25" else 150.0   # limites de referência
+        try:
+            return max(0.0, min(1.0, float(val) / ref))
+        except Exception:
+            return 0.0
+
+    sev = max(_norm_pm(pm25, "pm25"), _norm_pm(pm10, "pm10"))
+
+    # --- 2) duration (0..1): horas desde a última chuva (>0) — se choveu agora, 0
+    def _hours_since(iso_str: Optional[str]) -> Optional[float]:
+        if not iso_str:
+            return None
+        try:
+            dt_ = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            now_ = datetime.now(timezone.utc)
+            return max(0.0, (now_ - dt_).total_seconds() / 3600.0)
+        except Exception:
+            return None
+
+    if precip and float(precip) > 0:
+        dur = 0.0
+    else:
+        hrs = _hours_since(observed_at) or 12.0
+        dur = max(0.0, min(1.0, hrs / 12.0))  # seca “cheia” a partir de ~12h sem chuva
+        
+    # --- 3) Índice pluviométrico normalizado (0..1) com base no volume de chuva
+    def _pluviometric_index(precip: Optional[float]) -> Optional[float]:
+    """
+    Normaliza a precipitação (mm) para um índice 0..1.
+    Considera até 50mm como 'chuva máxima' (1.0). 
+    Valores acima são truncados em 1.0.
+    """
+        try:
+            if precip is None:
+                return None
+            p = float(precip)
+            if p <= 0:
+                return 0.0
+            return min(1.0, p / 50.0)  # exemplo: 25mm -> 0.5 | 50mm ou mais -> 1.0
+        except Exception:
+            return None
+
+
+    # --- 4) frequency (0..1): nº de focos normalizado
+    freq = max(0.0, min(1.0, focos_count / 50.0))  # ajustável
+
+    # --- 5) impact (0..1): vento normalizado
+    try:
+        imp = max(0.0, min(1.0, float(wind or 0.0) / 60.0))  # 60 km/h ~ 1.0
+    except Exception:
+        imp = 0.0
+
     return {
         "severity": round(sev, 4),
         "duration": round(dur, 4),
@@ -1320,10 +1394,11 @@ def build_alert_obs(weather_features: Dict[str, Any],
             "pm10": pm10,
             "precipitation": precip,
             "observed_at": observed_at,
-            "wind_speed_10m": wind,          # <<< novo
-            "focos_count": len(focos),       # <<< novo
+            "wind_speed_10m": wind,
+            "focos_count": focos_count,
         },
     }
+
 
 
 def compute_alert_score(alert_obs: Dict[str, Any],
@@ -1339,8 +1414,17 @@ def compute_alert_score(alert_obs: Dict[str, Any],
         imp * weights["impact"]
     )
     level = _classify_level(score)
-    return ScoreResult(score=round(score, 4), level=level,
-                       breakdown={"severity": sev, "duration": dur, "frequency": freq, "impact": imp})
+    return ScoreResult(
+    score=round(score, 4),
+    level=level,
+    breakdown={
+        "severity": sev,
+        "duration": dur,
+        "frequency": freq,
+        "impact": imp,
+        "precip_index": alert_obs.get("precip_index")  # novo campo vindo do build_alert_obs
+    }
+)
 
 
 # ==== [cell] =============================================
