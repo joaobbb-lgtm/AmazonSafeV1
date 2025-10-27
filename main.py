@@ -1307,38 +1307,24 @@ def _hours_since(iso_str: Optional[str]) -> Optional[float]:
 def build_alert_obs(weather_features: Dict[str, Any],
                     air_features: Dict[str, Any],
                     fire_features: Dict[str, Any]) -> Dict[str, Any]:
-    # severity: qualidade do ar
-    pm25 = (air_features or {}).get("pm25")
-    pm10 = (air_features or {}).get("pm10")
-    sev = max(_norm_pm(pm25, "pm25"), _norm_pm(pm10, "pm10"))
-
-    # duration: horas desde observed_at sem chuva relevante
-    precip = (weather_features or {}).get("precipitation") or 0.0
-    observed_at = (weather_features or {}).get("observed_at")
-    hrs = _hours_since(observed_at) or 0.0
-    no_rain = 1.0 if float(precip or 0.0) < 0.5 else 0.0
-    dur = _clip01((hrs / 24.0) * no_rain)
-
-    # frequency: densidade de focos (normaliza por teto)
+    # ... (cálculos acima)
     focos = ((fire_features or {}).get("focos") or [])
-    freq = _clip01(len(focos) / 200.0)
-
-    # impact: vento (0..12 m/s)
     wind = (weather_features or {}).get("wind_speed_10m")
-    imp = _clip01((float(wind) if isinstance(wind, (int, float)) else 0.0) / 12.0)
-
     return {
         "severity": round(sev, 4),
         "duration": round(dur, 4),
         "frequency": round(freq, 4),
         "impact":   round(imp, 4),
         "meta": {
-            "pm25": pm25, "pm10": pm10,
-            "precipitation": precip, "observed_at": observed_at,
-            "wind_speed_10m": wind,
-            "focos_count": len(focos),
-        }
+            "pm25": pm25,
+            "pm10": pm10,
+            "precipitation": precip,
+            "observed_at": observed_at,
+            "wind_speed_10m": wind,          # <<< novo
+            "focos_count": len(focos),       # <<< novo
+        },
     }
+
 
 def compute_alert_score(alert_obs: Dict[str, Any],
                         weights: Dict[str, float] = WEIGHTS) -> ScoreResult:
@@ -2536,11 +2522,21 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "lat": lat,
             "lon": lon,
             "resolve": meta_loc,
-            "weather_provider": body.weather_provider
+            "weather_provider": body.weather_provider,
+            "air_radius_m": body.air_radius_m,
+            "raio_km": body.raio_km,
+            "scope": body.scope,
+            "region": body.region,
+            "limit": body.limit,
         },
+        # <<< adicionados: pass-through com os FEATURES normalizados >>>
+        "weather": (weather or {}).get("features") or {},
+        "air":      (air or {}).get("features") or {},
+        "focos":    (focos or {}).get("features") or {},  # contém {focos:[...], count, meta}
+
+        "score": score_payload,   # já inclui score, level, breakdown, alert_obs, ai_pred/ai_alert
         "persisted": persisted,
-        "score": score_payload,
-        "errors": errors
+        "errors": errors,
     }
 
 
