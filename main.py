@@ -1262,10 +1262,11 @@ THRESHOLDS = {
 }
 
 WEIGHTS = {
-    "severity": 0.45,   # PMs
-    "duration": 0.20,   # horas sem chuva recente
-    "frequency": 0.20,  # número de focos INPE
-    "impact": 0.15,     # vento
+    "severity": 0.25,
+    "duration": 0.25,
+    "frequency": 0.25,
+    "impact": 0.15,
+    "rainfall": 0.10,  # novo peso para chuva
 }
 
 @dataclass
@@ -1303,6 +1304,23 @@ def _hours_since(iso_str: Optional[str]) -> Optional[float]:
         return max(0.0, (now - dt).total_seconds() / 3600.0)
     except Exception:
         return None
+
+# --- função auxiliar: índice de risco de chuva (alagamentos/enxurradas)
+def _rainfall_risk_u(mm: Optional[float]) -> float:
+    """
+    Calcula um índice de risco de chuva entre 0..1
+    - 0: sem chuva
+    - 1: chuva muito intensa (>50mm/h)
+    """
+    if mm is None:
+        return 0.0
+    mm = float(mm)
+    if mm <= 0:
+        return 0.0
+    if mm >= 50:
+        return 1.0
+    return mm / 50.0
+
 
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
@@ -1404,28 +1422,57 @@ def build_alert_obs(weather_features: Dict[str, Any],
 
 def compute_alert_score(alert_obs: Dict[str, Any],
                         weights: Dict[str, float] = WEIGHTS) -> ScoreResult:
+    """
+    Calcula o score final (0..1) com base em severity/duration/frequency/impact
+    e também no índice pluviométrico (rainfall).
+
+    O índice pluviométrico é calculado a partir da precipitação acumulada em 24h
+    e normalizado em 0..1 via `_rainfall_index`.
+
+    Breakdown retorna todos os componentes individuais + valores brutos.
+    """
+
+    # --- 1) Campos principais (clip 0..1 por segurança) ---------------------
     sev = _clip01(alert_obs.get("severity", 0))
     dur = _clip01(alert_obs.get("duration", 0))
     freq = _clip01(alert_obs.get("frequency", 0))
     imp = _clip01(alert_obs.get("impact", 0))
-    score = (
-        sev * weights["severity"] +
-        dur * weights["duration"] +
-        freq * weights["frequency"] +
-        imp * weights["impact"]
+
+    # --- 2) Índice pluviométrico --------------------------------------------
+    precip_24h = (
+        alert_obs.get("precip_24h")
+        or alert_obs.get("precipitation")
+        or (alert_obs.get("meta", {}).get("precipitation"))
+        or 0.0
     )
+    rainfall = _rainfall_index(precip_24h)  # valor normalizado 0..1
+
+    # --- 3) Score final -----------------------------------------------------
+    score = (
+        sev * weights.get("severity", 0.25) +
+        dur * weights.get("duration", 0.25) +
+        freq * weights.get("frequency", 0.25) +
+        imp * weights.get("impact", 0.15) +
+        rainfall * weights.get("rainfall", 0.10)   # chuva agora conta no score
+    )
+
+    # --- 4) Classificação qualitativa (verde, amarelo, vermelho...) ---------
     level = _classify_level(score)
+
+    # --- 5) Retorno estruturado ---------------------------------------------
     return ScoreResult(
-    score=round(score, 4),
-    level=level,
-    breakdown={
-        "severity": sev,
-        "duration": dur,
-        "frequency": freq,
-        "impact": imp,
-        "precip_index": alert_obs.get("precip_index")  # novo campo vindo do build_alert_obs
-    }
-)
+        score=round(score, 4),
+        level=level,
+        breakdown={
+            "severity": sev,
+            "duration": dur,
+            "frequency": freq,
+            "impact": imp,
+            "precip_index": rainfall,     # índice 0..1
+            "precip_24h_mm": float(precip_24h) if precip_24h is not None else None,
+        },
+    )
+
 
 
 # ==== [cell] =============================================
