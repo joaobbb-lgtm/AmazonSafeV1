@@ -1359,20 +1359,21 @@ def build_alert_obs(weather_features: Dict[str, Any],
         
     # --- 3) Índice pluviométrico normalizado (0..1) com base no volume de chuva
     def _pluviometric_index(precip: Optional[float]) -> Optional[float]:
-    """
-    Normaliza a precipitação (mm) para um índice 0..1.
-    Considera até 50mm como 'chuva máxima' (1.0). 
-    Valores acima são truncados em 1.0.
-    """
+        """
+        Normaliza a precipitação (mm) para um índice 0..1.
+        Considera até 50mm como 'chuva máxima' (1.0). 
+        Valores acima são truncados em 1.0.
+        """
         try:
             if precip is None:
-                return None
-            p = float(precip)
-            if p <= 0:
                 return 0.0
-            return min(1.0, p / 50.0)  # exemplo: 25mm -> 0.5 | 50mm ou mais -> 1.0
+            p = float(precip)
         except Exception:
-            return None
+            return 0.0
+
+        if p <= 0:
+            return 0.0
+        return min(1.0, p / 50.0)
 
 
     # --- 4) frequency (0..1): nº de focos normalizado
