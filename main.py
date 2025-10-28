@@ -1251,8 +1251,8 @@ from datetime import datetime, timezone
 import math
 
 THRESHOLDS = {
-    "green_lt": 0.33,   # score < 0.40 => VERDE
-    "yellow_lt": 0.66,  # 0.40 <= score < 0.70 => AMARELO
+    "green_lt": 0.33,   # score < 0.33 => VERDE
+    "yellow_lt": 0.66,  # 0.33 <= score < 0.66 => AMARELO
     # score >= 0.66 => VERMELHO
 }
 
@@ -1261,7 +1261,7 @@ WEIGHTS = {
     "duration": 0.25,
     "frequency": 0.25,
     "impact": 0.15,
-    "rainfall": 0.10,  # novo peso para chuva
+    "rainfall": 0.10,  # peso da chuva
 }
 
 @dataclass
@@ -1305,114 +1305,24 @@ def _rainfall_risk_u(mm: Optional[float]) -> float:
     """
     Calcula um índice de risco de chuva entre 0..1
     - 0: sem chuva
-    - 1: chuva muito intensa (>50mm/h)
+    - 1: chuva muito intensa (>50mm)
     """
     if mm is None:
         return 0.0
-    mm = float(mm)
+    try:
+        mm = float(mm)
+    except Exception:
+        return 0.0
+
     if mm <= 0:
         return 0.0
     if mm >= 50:
         return 1.0
     return mm / 50.0
 
-
-from typing import Dict, Any, Optional
-from datetime import datetime, timezone
-
-def build_alert_obs(weather_features: Dict[str, Any],
-                    air_features: Dict[str, Any],
-                    fire_features: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Consolida as features (tempo/ar/fogo) em componentes de score:
-      - severity: poluição (PMs) normalizada
-      - duration: 'tempo seco' (horas desde a última chuva > 0)
-      - frequency: nº de focos (INPE) normalizado
-      - impact: vento (km/h) normalizado
-    """
-
-    # --- Leituras brutas
-    pm25 = (air_features or {}).get("pm25")
-    pm10 = (air_features or {}).get("pm10")
-    precip = (weather_features or {}).get("precipitation")
-    wind = (weather_features or {}).get("wind_speed_10m")
-    observed_at = (weather_features or {}).get("observed_at")
-
-    focos = ((fire_features or {}).get("focos") or [])
-    focos_count = len(focos)
-
-    # --- 1) severity (0..1) pelos PMs
-    def _norm_pm(val: Optional[float], kind: str) -> float:
-        if val is None:
-            return 0.0
-        ref = 75.0 if kind == "pm25" else 150.0   # limites de referência
-        try:
-            return max(0.0, min(1.0, float(val) / ref))
-        except Exception:
-            return 0.0
-
-    sev = max(_norm_pm(pm25, "pm25"), _norm_pm(pm10, "pm10"))
-
-    # --- 2) duration (0..1): horas desde a última chuva (>0) — se choveu agora, 0
-    def _hours_since(iso_str: Optional[str]) -> Optional[float]:
-        if not iso_str:
-            return None
-        try:
-            dt_ = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-            now_ = datetime.now(timezone.utc)
-            return max(0.0, (now_ - dt_).total_seconds() / 3600.0)
-        except Exception:
-            return None
-
-    if precip and float(precip) > 0:
-        dur = 0.0
-    else:
-        hrs = _hours_since(observed_at) or 12.0
-        dur = max(0.0, min(1.0, hrs / 12.0))  # seca “cheia” a partir de ~12h sem chuva
-        
-    # --- 3) Índice pluviométrico normalizado (0..1) com base no volume de chuva
-    def _pluviometric_index(precip: Optional[float]) -> Optional[float]:
-        """
-        Normaliza a precipitação (mm) para um índice 0..1.
-        Considera até 50mm como 'chuva máxima' (1.0). 
-        Valores acima são truncados em 1.0.
-        """
-        try:
-            if precip is None:
-                return 0.0
-            p = float(precip)
-        except Exception:
-            return 0.0
-
-        if p <= 0:
-            return 0.0
-        return min(1.0, p / 50.0)
-
-
-    # --- 4) frequency (0..1): nº de focos normalizado
-    freq = max(0.0, min(1.0, focos_count / 50.0))  # ajustável
-
-    # --- 5) impact (0..1): vento normalizado
-    try:
-        imp = max(0.0, min(1.0, float(wind or 0.0) / 60.0))  # 60 km/h ~ 1.0
-    except Exception:
-        imp = 0.0
-
-    return {
-        "severity": round(sev, 4),
-        "duration": round(dur, 4),
-        "frequency": round(freq, 4),
-        "impact":   round(imp, 4),
-        "meta": {
-            "pm25": pm25,
-            "pm10": pm10,
-            "precipitation": precip,
-            "observed_at": observed_at,
-            "wind_speed_10m": wind,
-            "focos_count": focos_count,
-        },
-    }
-
+# ✅ alias compatível — compute_alert_score chama aqui
+def _rainfall_index(mm: Optional[float]) -> float:
+    return _rainfall_risk_u(mm)
 
 
 def compute_alert_score(alert_obs: Dict[str, Any],
@@ -1421,40 +1331,37 @@ def compute_alert_score(alert_obs: Dict[str, Any],
     Calcula o score final (0..1) com base em severity/duration/frequency/impact
     e também no índice pluviométrico (rainfall).
 
-    O índice pluviométrico é calculado a partir da precipitação acumulada em 24h
-    e normalizado em 0..1 via `_rainfall_index`.
-
     Breakdown retorna todos os componentes individuais + valores brutos.
     """
 
-    # --- 1) Campos principais (clip 0..1 por segurança) ---------------------
+    # --- 1) Campos principais (clip 0..1 por segurança)
     sev = _clip01(alert_obs.get("severity", 0))
     dur = _clip01(alert_obs.get("duration", 0))
     freq = _clip01(alert_obs.get("frequency", 0))
     imp = _clip01(alert_obs.get("impact", 0))
 
-    # --- 2) Índice pluviométrico --------------------------------------------
+    # --- 2) Índice pluviométrico
     precip_24h = (
         alert_obs.get("precip_24h")
         or alert_obs.get("precipitation")
         or (alert_obs.get("meta", {}).get("precipitation"))
         or 0.0
     )
-    rainfall = _rainfall_index(precip_24h)  # valor normalizado 0..1
+    rainfall = _rainfall_index(precip_24h)
 
-    # --- 3) Score final -----------------------------------------------------
+    # --- 3) Score final ponderado
     score = (
         sev * weights.get("severity", 0.25) +
         dur * weights.get("duration", 0.25) +
         freq * weights.get("frequency", 0.25) +
         imp * weights.get("impact", 0.15) +
-        rainfall * weights.get("rainfall", 0.10)   # chuva agora conta no score
+        rainfall * weights.get("rainfall", 0.10)
     )
 
-    # --- 4) Classificação qualitativa (verde, amarelo, vermelho...) ---------
+    # --- 4) Classificação qualitativa
     level = _classify_level(score)
 
-    # --- 5) Retorno estruturado ---------------------------------------------
+    # --- 5) Retorno estruturado
     return ScoreResult(
         score=round(score, 4),
         level=level,
@@ -1463,11 +1370,10 @@ def compute_alert_score(alert_obs: Dict[str, Any],
             "duration": dur,
             "frequency": freq,
             "impact": imp,
-            "precip_index": rainfall,     # índice 0..1
+            "precip_index": rainfall,  # índice 0..1
             "precip_24h_mm": float(precip_24h) if precip_24h is not None else None,
         },
     )
-
 
 
 # ==== [cell] =============================================
@@ -2534,25 +2440,25 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     persisted = {"weather": 0, "air": 0, "fire": 0, "alert_score": 0}
     errors = {}
 
-    # Weather
+    # -------- Weather --------
     weather = {}
     try:
         weather = _collect_weather(lat, lon, provider=body.weather_provider)
-        save_weather(lat, lon, weather["features"], weather["payload"])
+        save_weather(lat, lon, weather.get("features") or {}, weather.get("payload"))
         persisted["weather"] += 1
     except Exception as e:
         errors["weather"] = str(e)
 
-    # Air
+    # -------- Air --------
     air = {}
     try:
         air = _collect_air(lat, lon, radius_m=body.air_radius_m)
-        save_air(lat, lon, "openaq", air.get("location_id"), air.get("features"), {"locations": air.get("locations")})
+        save_air(lat, lon, "openaq", air.get("location_id"), air.get("features") or {}, {"locations": air.get("locations")})
         persisted["air"] += 1
     except Exception as e:
         errors["air"] = str(e)
 
-    # INPE
+    # -------- INPE / Fire --------
     focos = {}
     try:
         focos = _collect_inpe(lat, lon, body.raio_km, body.scope, body.region, body.limit)
@@ -2564,68 +2470,49 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     # ---- Score & Persistência do alerta --------------------------------------
     score_payload = {}
     try:
-        # requer: build_alert_obs, compute_alert_score, save_alert_score, handle_level_transition (definidos antes)
+        # 1) Observação consolidada
         alert_obs = build_alert_obs(
             weather_features=(weather or {}).get("features") or {},
             air_features=(air or {}).get("features") or {},
             fire_features=(focos or {}).get("features") or {},
         )
+
+        # 2) Score por regras
         sr = compute_alert_score(alert_obs)
 
-        # ===== [GRUPO 2 — IA / análise de risco] =========================
-        # Usa os dados já coletados para construir features e classificar
+        # 3) IA (opcional) — não deve bloquear o restante
         try:
-            # monta um "obs" no formato esperado pelo analytics.features
             obs_ai = {
                 "weather": (weather or {}).get("features") or {},
                 "air":     (air or {}).get("features") or {},
-                "inpe":    (focos or {}).get("features") or {},   # espera conter "count" e "focos"
+                "inpe":    (focos or {}).get("features") or {},
             }
-
-            # 1) features
             feat = build_features(obs_ai)
-
-            # 2) baseline por regras
             alerta_rules, pred_rules = classify_by_rules(feat)
+            pred = predict(feat)  # -> (label, {label:proba,...}) ou None
 
-            # 3) tentativa com modelo treinado (se houver models/risk_rf.joblib)
-            pred = predict(feat)   # -> (label, {label:proba,...}) ou None
             if pred:
                 alerta_final, proba = pred
-                pred_json = {
-                    "modelo": MODEL_VERSION,
-                    "proba": proba,
-                    "features": feat,
-                    "baseline": pred_rules,
-                }
+                pred_json = {"modelo": MODEL_VERSION, "proba": proba, "features": feat, "baseline": pred_rules}
             else:
                 alerta_final = alerta_rules
-                pred_json = {
-                    "modelo": "rules_v1",
-                    "proba": pred_rules.get("p", {}),
-                    "features": feat,
-                }
+                pred_json = {"modelo": "rules_v1", "proba": pred_rules.get("p", {}), "features": feat}
 
-            # anexa no payload de score (vai aparecer na resposta)
             score_payload["ai_alert"] = alerta_final
             score_payload["ai_pred"]  = pred_json
-
-            # também guarda dentro do AlertObs enviado ao save_alert_score
-            # (útil para auditoria e para o front consumir)
             try:
                 alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
             except Exception:
                 pass
 
         except Exception as _ai_err:
-            # não derruba o endpoint se der erro na IA
+            # IA falhou? Só registra o erro; não interrompe o fluxo
             score_payload["ai_error"] = str(_ai_err)
-        # ===== [GRUPO 2 — fim] ============================================
 
-        # defina um alert_id estável (pode ser por cidade ou por lat/lon)
+        # 4) Identificador do alerta (sempre)
         alert_id = (body.cidade or f"geo:{lat:.4f},{lon:.4f}").strip()
 
-        # persiste score/nível + AlertObs
+        # 5) Persistência e transição (sempre)
         save_alert_score(
             alert_id=alert_id,
             score=sr.score,
@@ -2645,35 +2532,31 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             }
         )
 
-        # registra transição e notifica (com debounce)
         handle_level_transition(
             alert_id=alert_id,
             new_level=sr.level,
             score=sr.score,
             alert_obs=alert_obs,
             extra={"cidade": body.cidade, "lat": lat, "lon": lon}
-            # notify_on_bootstrap=False  # padrão
         )
-        
-        # grava também no NDJSON
+
         _append_alerta_ndjson(alert_id, sr, alert_obs)
-        
-        # **não sobrescrever** o que já foi colocado em score_payload (IA)
+
+        # 6) Preenche payload para o front (sempre)
         score_payload.update({
             "alert_id": alert_id,
             "score": sr.score,
             "level": sr.level,
-
             "level_color": level_to_color(sr.level),
-            "breakdown": sr.breakdown,
+            "breakdown": sr.breakdown,   # <- ESSENCIAL
             "alert_obs": alert_obs
         })
 
-        # Fallbacks leves p/ não deixar a análise em branco no front
+        # Fallbacks leves p/ não deixar vazio
         score_payload.setdefault("ai_alert", {"label": "desconhecido"})
         score_payload.setdefault("ai_pred", {"modelo": "none", "proba": {}, "features": {}})
 
-        # Status do KPI "água" (usa ar como proxy de disponibilidade)
+        # Status do KPI "água" (proxy simples)
         air_features = (air or {}).get("features") or {}
         score_payload["air_status"] = "ok" if air_features else "sem_estacao"
 
@@ -2682,6 +2565,7 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     except Exception as e:
         errors["alert_score"] = str(e)
 
+    # --------- Resposta ao front ---------
     return {
         "ok": True,
         "params": {
@@ -2696,19 +2580,13 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "region": body.region,
             "limit": body.limit,
         },
-        # <<< adicionados: pass-through com os FEATURES normalizados >>>
         "weather": (weather or {}).get("features") or {},
         "air":      (air or {}).get("features") or {},
-        "focos":    (focos or {}).get("features") or {},  # contém {focos:[...], count, meta}
-
-        "score": score_payload,   # já inclui score, level, breakdown, alert_obs, ai_pred/ai_alert
+        "focos":    (focos or {}).get("features") or {},
+        "score": score_payload,   # inclui score, level, breakdown, alert_obs, IA
         "persisted": persisted,
         "errors": errors,
     }
-
-
-
-
 
 def _collect_basics(lat: float, lon: float) -> dict:
     """
