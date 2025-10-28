@@ -2415,6 +2415,143 @@ def api_data(
         out["focos_error"] = str(e)
 
     return out
+    
+# ============ GARANTIA DE SCORING (fallbacks se faltarem) ============
+
+from dataclasses import dataclass
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+import math
+
+# Limiares e pesos básicos (use os seus, se já existirem)
+THRESHOLDS = globals().get("THRESHOLDS", {
+    "green_lt": 0.33,
+    "yellow_lt": 0.66,
+})
+WEIGHTS = globals().get("WEIGHTS", {
+    "severity": 0.25,
+    "duration": 0.25,
+    "frequency": 0.25,
+    "impact":   0.15,
+    "rainfall": 0.10,
+})
+
+@dataclass
+class ScoreResult:
+    score: float
+    level: str
+    breakdown: Dict[str, float]
+
+def _clip01(x: float) -> float:
+    try: return max(0.0, min(1.0, float(x)))
+    except Exception: return 0.0
+
+def _classify_level(score: float) -> str:
+    if score < THRESHOLDS["green_lt"]: return "verde"
+    if score < THRESHOLDS["yellow_lt"]: return "amarelo"
+    return "vermelho"
+
+# ---- índice de chuva (0..1) ----
+if "_rainfall_index" not in globals():
+    def _rainfall_index(mm: Optional[float]) -> float:
+        """Normaliza precipitação (mm) para 0..1 (cap em 50mm)."""
+        if mm is None: return 0.0
+        try: v = float(mm)
+        except Exception: return 0.0
+        if v <= 0: return 0.0
+        return 1.0 if v >= 50.0 else (v / 50.0)
+
+# ---- consolidador de observações (se faltar) ----
+if "build_alert_obs" not in globals():
+    def build_alert_obs(weather_features: Dict[str, Any],
+                        air_features: Dict[str, Any],
+                        fire_features: Dict[str, Any]) -> Dict[str, Any]:
+        pm25 = (air_features or {}).get("pm25")
+        pm10 = (air_features or {}).get("pm10")
+        precip = (weather_features or {}).get("precipitation")
+        wind = (weather_features or {}).get("wind_speed_10m")
+        observed_at = (weather_features or {}).get("observed_at")
+        focos = ((fire_features or {}).get("focos") or [])
+        focos_count = len(focos)
+
+        # severity: pior dos PMs normalizado
+        def _norm_pm(val, kind):
+            if val is None: return 0.0
+            ref = 75.0 if kind == "pm25" else 150.0
+            try: return _clip01(float(val) / ref)
+            except Exception: return 0.0
+        sev = max(_norm_pm(pm25, "pm25"), _norm_pm(pm10, "pm10"))
+
+        # duration: horas sem chuva (observed_at) -> 0..1
+        def _hours_since(iso_str: Optional[str]) -> Optional[float]:
+            if not iso_str: return None
+            try:
+                dt_ = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+                now_ = datetime.now(timezone.utc)
+                return max(0.0, (now_ - dt_).total_seconds()/3600.0)
+            except Exception:
+                return None
+        if precip and float(precip) > 0:
+            dur = 0.0
+        else:
+            hrs = _hours_since(observed_at) or 12.0
+            dur = _clip01(hrs / 12.0)
+
+        # frequency: nº de focos normalizado
+        freq = _clip01(focos_count / 50.0)
+
+        # impact: vento normalizado (60km/h ~ 1.0)
+        try:  imp = _clip01(float(wind or 0.0) / 60.0)
+        except Exception: imp = 0.0
+
+        return {
+            "severity": round(sev, 4),
+            "duration": round(dur, 4),
+            "frequency": round(freq, 4),
+            "impact":   round(imp, 4),
+            "meta": {
+                "pm25": pm25, "pm10": pm10,
+                "precipitation": precip,
+                "observed_at": observed_at,
+                "wind_speed_10m": wind,
+                "focos_count": focos_count,
+            },
+        }
+
+# ---- cálculo do score (se faltar) ----
+if "compute_alert_score" not in globals():
+    def compute_alert_score(alert_obs: Dict[str, Any],
+                            weights: Dict[str, float] = WEIGHTS) -> ScoreResult:
+        sev = _clip01(alert_obs.get("severity", 0))
+        dur = _clip01(alert_obs.get("duration", 0))
+        freq = _clip01(alert_obs.get("frequency", 0))
+        imp = _clip01(alert_obs.get("impact", 0))
+        precip_24h = (
+            alert_obs.get("precip_24h")
+            or alert_obs.get("precipitation")
+            or (alert_obs.get("meta", {}).get("precipitation"))
+            or 0.0
+        )
+        rain = _rainfall_index(precip_24h)
+        score = (
+            sev * weights.get("severity", 0.25) +
+            dur * weights.get("duration", 0.25) +
+            freq * weights.get("frequency", 0.25) +
+            imp * weights.get("impact",   0.15) +
+            rain* weights.get("rainfall", 0.10)
+        )
+        level = _classify_level(score)
+        return ScoreResult(
+            score=round(score, 4),
+            level=level,
+            breakdown={
+                "severity": sev, "duration": dur,
+                "frequency": freq, "impact": imp,
+                "precip_index": rain,
+                "precip_24h_mm": float(precip_24h) if precip_24h is not None else None,
+            },
+        )
+# ================== FIM DO BLOCO DE GARANTIA ==================
 
 # -------------------------
 # POST /api/alertas_update (persistência + score/nível)
