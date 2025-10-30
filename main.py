@@ -19,7 +19,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 # ==== [cell] =============================================
 # @title Setup de dependências (Colab/Notebook)
 # Se estiver em Colab, isto instala os pacotes necessários.
-# Em outras máquinas, use: pip install -U sqlmodel "SQLAlchemy>=2" "pydantic>=2,<3" fastapi uvicorn[standard] requests pandas
+# Em outras máquinas, use:  install -U sqlmodel "SQLAlchemy>=2" "pydantic>=2,<3" fastapi uvicorn[standard] requests pandas
 
 
 # Cria as tabelas no banco, se não existirem
@@ -62,7 +62,7 @@ need += [
 # Instala apenas se houver algo faltando
 if need:
     print("Instalando pacotes:", need)
-    pip_install(need)
+    _install(need)
 else:
     print("Todos os pacotes principais já estão instalados.")
 
@@ -96,6 +96,13 @@ try:
     _json_dumps = lambda obj: orjson.dumps(obj).decode("utf-8")
 except Exception:
     _json_dumps = lambda obj: json.dumps(obj, ensure_ascii=False)
+
+# >>> AIR-IMPORTS-START
+from typing import Optional, Dict, Any, Tuple
+import os, math, time
+import httpx
+# >>> AIR-IMPORTS-END
+
 
 # --- NDJSON de alertas (para Grupo 3/4 lerem sem SQL) ---
 
@@ -188,6 +195,12 @@ print("Config ok.",
 # Aqui a chave já está fixa (para simplificar no Colab)
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
+# >>> AIR-CONFIG-START
+AIR_TIMEOUT_SECS = float(os.getenv("AIR_TIMEOUT_SECS", "7.0"))
+AIR_STALE_MINUTES = int(os.getenv("AIR_STALE_MINUTES", "180"))
+AIR_RADIUS_SEQ = os.getenv("AIR_RADIUS_SEQ", "10000,25000,50000,75000")
+AIR_ENABLE_MODEL_FALLBACK = os.getenv("AIR_ENABLE_MODEL_FALLBACK", "1") == "1"
+# >>> AIR-CONFIG-END
 
 # ==== [cell] =============================================
 ## 1) Utilitários (cache TTL, geocoder, haversine, helpers)
@@ -1680,6 +1693,106 @@ def api_weather(
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
+
+# >>> AIR-ADAPTERS-START
+async def _fetch_openaq_pm25(lat: float, lon: float, radius_m: int) -> Optional[Dict[str, Any]]:
+    """
+    Busca a medição mais recente de PM2.5 no OpenAQ (estação mais próxima dentro do raio).
+    """
+    url = (
+        "https://api.openaq.org/v3/measurements"
+        f"?coordinates={lat:.6f},{lon:.6f}"
+        f"&radius={radius_m}"
+        "&parameter=pm25&limit=1&sort=desc&order_by=datetime"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=AIR_TIMEOUT_SECS) as cli:
+            r = await cli.get(url)
+            r.raise_for_status()
+            js = r.json()
+            results = js.get("results") or []
+            if not results:
+                return None
+            m = results[0]
+            pm25 = m.get("value")
+            loc = m.get("location")
+            prov = m.get("provider") or "openaq"
+            dtime = (m.get("date") or {}).get("utc") or (m.get("date") or {}).get("local")
+            if not _is_valid_pm25(pm25):
+                return {
+                    "pm25": None, "source": "station", "estimated": False,
+                    "radius_m": radius_m, "station": {"name": loc, "provider": prov, "datetime": dtime}
+                }
+            return {
+                "pm25": float(pm25), "source": "station", "estimated": False,
+                "radius_m": radius_m, "station": {"name": loc, "provider": prov, "datetime": dtime}
+            }
+    except Exception:
+        return None
+
+async def _fetch_openmeteo_model_pm25(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """
+    Fallback por modelo global (Open-Meteo Air Quality).
+    """
+    url = (
+        "https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat:.6f}&longitude={lon:.6f}"
+        "&hourly=pm2_5&forecast_days=0&past_days=1&timezone=UTC"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=AIR_TIMEOUT_SECS) as cli:
+            r = await cli.get(url)
+            r.raise_for_status()
+            js = r.json()
+            hourly = (js.get("hourly") or {})
+            times = hourly.get("time") or []
+            pm25s = hourly.get("pm2_5") or []
+            if not times or not pm25s:
+                return None
+            pm25 = pm25s[-1]
+            if not _is_valid_pm25(pm25):
+                return {"pm25": None, "source": "model", "estimated": True, "radius_m": None, "station": None}
+            return {"pm25": float(pm25), "source": "model", "estimated": True, "radius_m": None, "station": None}
+    except Exception:
+        return None
+# >>> AIR-ADAPTERS-END
+
+# >>> AIR-RESOLVER-START
+async def resolve_air_quality(lat: float, lon: float, air_radius_m: Optional[int] = None) -> Tuple[Dict[str, Any], str]:
+    """
+    Tenta estações (OpenAQ) com raios progressivos; se não houver dado válido, cai no modelo (Open-Meteo).
+    Retorna (air_dict, air_status), onde air_status ∈ {"ok", "sem_estacao", "sem_dado"}.
+    """
+    seq = [int(x) for x in AIR_RADIUS_SEQ.split(",") if x.strip().isdigit()]
+    if air_radius_m and air_radius_m not in seq:
+        seq = [air_radius_m] + [r for r in seq if r != air_radius_m]
+
+    last_station_meta = None
+
+    # 1) Estações
+    for radius in seq:
+        r = await _fetch_openaq_pm25(lat, lon, radius)
+        if r is None:
+            continue
+        last_station_meta = r
+        if _is_valid_pm25(r.get("pm25")):
+            return (r, "ok")
+
+    # 2) Fallback por modelo
+    if AIR_ENABLE_MODEL_FALLBACK:
+        fm = await _fetch_openmeteo_model_pm25(lat, lon)
+        if fm and _is_valid_pm25(fm.get("pm25")):
+            return (fm, "ok")
+        return (_coalesce(fm, {"pm25": None, "source": "model", "estimated": True, "radius_m": None, "station": None}), "sem_dado")
+
+    # 3) Sem fallback habilitado
+    if last_station_meta is None:
+        return ({"pm25": None, "source": "station", "estimated": False, "radius_m": None, "station": None}, "sem_estacao")
+    else:
+        return (last_station_meta, "sem_dado")
+# >>> AIR-RESOLVER-END
+
+
 # ------------------------------------------------------------------------------
 # Air (OpenAQ v3) + fallbacks
 # ------------------------------------------------------------------------------
@@ -2204,6 +2317,29 @@ def level_to_color(level: str) -> str:
         return "#eab308"
     return "#22c55e"
 
+# >>> AIR-HELPERS-START
+import time  # (mantenha no topo do arquivo se preferir)
+
+def _now_unix() -> int:
+    return int(time.time())
+
+def _coalesce(*vals, default=None):
+    for v in vals:
+        if v is not None:
+            return v
+    return default
+
+def _is_valid_pm25(x: Optional[float]) -> bool:
+    """
+    Muitos provedores devolvem 0.0 quando não há medição.
+    Ajuste o limiar se quiser (ex.: >= 0.5). Mantive >= 1.0 µg/m³.
+    """
+    try:
+        xf = float(x)
+        return math.isfinite(xf) and xf >= 1.0
+    except Exception:
+        return False
+# >>> AIR-HELPERS-END
 
 
 # -------------------------
@@ -2556,6 +2692,9 @@ if "compute_alert_score" not in globals():
 # -------------------------
 # POST /api/alertas_update (persistência + score/nível)
 # -------------------------
+from typing import Optional, Literal
+import asyncio  # <- necessário para o wrapper síncrono do resolver
+
 class AlertasUpdateBody(BaseModel):
     cidade: Optional[str] = None
     lat: Optional[float] = None
@@ -2567,30 +2706,65 @@ class AlertasUpdateBody(BaseModel):
     limit: int = 300
     weather_provider: Literal["open-meteo", "owm"] = "open-meteo"
 
+# --- Wrapper síncrono para chamar o resolver assíncrono de qualidade do ar ----
+def resolve_air_quality_sync(lat: float, lon: float, air_radius_m: Optional[int] = None):
+    """
+    Chama resolve_air_quality (async) a partir de um endpoint síncrono.
+    Usa o loop corrente se existir; caso contrário, cria um novo.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        return loop.run_until_complete(resolve_air_quality(lat, lon, air_radius_m=air_radius_m))
+    except RuntimeError:
+        # Sem loop ativo: cria um novo
+        return asyncio.run(resolve_air_quality(lat, lon, air_radius_m=air_radius_m))
+
+
 @app.post(
     "/api/alertas_update",
     summary="Atualiza observações no banco (clima, ar, focos INPE) e calcula score/nível",
     tags=["Persistência"]
 )
 def api_alertas_update(body: AlertasUpdateBody = Body(...)):
+    # Resolve coordenadas
     lat, lon, meta_loc = _resolve_location(cidade=body.cidade, lat=body.lat, lon=body.lon)
+
     persisted = {"weather": 0, "air": 0, "fire": 0, "alert_score": 0}
     errors = {}
 
     # -------- Weather --------
     weather = {}
     try:
-        weather = _collect_weather(lat, lon, provider=body.weather_provider)
+        weather = _collect_weather(lat, lon, provider=body.weather_provider)  # mantém sua função
         save_weather(lat, lon, weather.get("features") or {}, weather.get("payload"))
         persisted["weather"] += 1
     except Exception as e:
         errors["weather"] = str(e)
 
-    # -------- Air --------
+    # -------- Air (resolver com raio progressivo + fallback de modelo) --------
+    # Estrutura padronizada esperada pelo front:
+    #   air_status ∈ {"ok", "sem_estacao", "sem_dado"}
+    #   air = {
+    #     "pm25": <float|null>, "source": "station|model", "estimated": bool,
+    #     "radius_m": <int|null>, "station": {...}, "features": {"pm25": <...>}
+    #   }
     air = {}
+    air_status = "sem_dado"
     try:
-        air = _collect_air(lat, lon, radius_m=body.air_radius_m)
-        save_air(lat, lon, "openaq", air.get("location_id"), air.get("features") or {}, {"locations": air.get("locations")})
+        air_dict, air_status = resolve_air_quality_sync(lat, lon, air_radius_m=body.air_radius_m)
+        air = {
+            "pm25": air_dict.get("pm25"),
+            "source": air_dict.get("source"),
+            "estimated": bool(air_dict.get("estimated")),
+            "radius_m": air_dict.get("radius_m"),
+            "station": air_dict.get("station"),
+            "features": {"pm25": air_dict.get("pm25")}  # compat com o front antigo
+        }
+        # Persistência leve (mantém a tabela/NDJSON compatível com seu fluxo atual)
+        try:
+            save_air(lat, lon, air.get("source") or "openaq/model", air.get("station"), air, raw=air)
+        except Exception:
+            pass
         persisted["air"] += 1
     except Exception as e:
         errors["air"] = str(e)
@@ -2610,7 +2784,7 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         # 1) Observação consolidada
         alert_obs = build_alert_obs(
             weather_features=(weather or {}).get("features") or {},
-            air_features=(air or {}).get("features") or {},
+            air_features=(air or {}).get("features") or {},     # usa o PM2.5 padronizado
             fire_features=(focos or {}).get("features") or {},
         )
 
@@ -2693,9 +2867,8 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         score_payload.setdefault("ai_alert", {"label": "desconhecido"})
         score_payload.setdefault("ai_pred", {"modelo": "none", "proba": {}, "features": {}})
 
-        # Status do KPI "água" (proxy simples)
-        air_features = (air or {}).get("features") or {}
-        score_payload["air_status"] = "ok" if air_features else "sem_estacao"
+        # Status do KPI de AR com base no resolver (não confundir com "água")
+        score_payload["air_status"] = air_status
 
         persisted["alert_score"] += 1
 
@@ -2718,118 +2891,11 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "limit": body.limit,
         },
         "weather": (weather or {}).get("features") or {},
-        "air":      (air or {}).get("features") or {},
+        "air_status": air_status,         # <- novo campo explícito
+        "air":      air or {},            # <- estrutura padronizada com pm25/source/etc
         "focos":    (focos or {}).get("features") or {},
-        "score": score_payload,   # inclui score, level, breakdown, alert_obs, IA
+        "score": score_payload,           # inclui score, level, breakdown, alert_obs, IA e air_status
         "persisted": persisted,
         "errors": errors,
     }
 
-def _collect_basics(lat: float, lon: float) -> dict:
-    """
-    Coleta clima (Open-Meteo e/ou OWM), qualidade do ar (OpenAQ) e focos (INPE).
-    Sempre retorna estrutura completa para evitar "análise em branco".
-    """
-    # Clima
-    try:
-        wx_om = normalize_open_meteo(get_open_meteo(lat, lon) or {})
-    except Exception:
-        wx_om = {}
-    try:
-        wx_owm_raw = get_openweather(lat, lon)
-        wx_owm = normalize_openweather(wx_owm_raw) if wx_owm_raw else {}
-    except Exception:
-        wx_owm = {}
-    weather = wx_owm or wx_om or {}
-
-    # Ar (OpenAQ)
-    air = {}
-    try:
-        locs = openaq_locations(lat, lon, radius_m=15000, limit=5)
-        results = (locs or {}).get("results") or []
-        if results:
-            best_id = results[0].get("id")
-            latest = openaq_latest_by_location_id(best_id)
-            sensors = openaq_sensors_by_location_id(best_id)
-            air = normalize_openaq_v3_latest(latest, sensors)
-    except Exception:
-        air = {}
-
-    # Focos (INPE)
-    focos = {"features": {"focos": [], "count": 0, "meta": {}}, "payload": {}}
-    try:
-        focos = inpe_focos_near(lat, lon, raio_km=150)
-    except Exception:
-        pass
-
-    return {"weather": weather, "air": air, "focos": focos}
-
-
-@app.get("/analise")
-def analise(cidade: str | None = Query(default=None), lat: float | None = None, lon: float | None = None):
-    """
-    Produz score/nível + blocos para KPIs.
-    Nunca retorna em branco: degrada com dados parciais quando necessário.
-    """
-    try:
-        if (lat is None or lon is None) and cidade:
-            g = geocode_city(cidade)
-            if g:
-                lat, lon = g["lat"], g["lon"]
-    except Exception:
-        pass
-    lat = lat if lat is not None else DEFAULT_LAT
-    lon = lon if lon is not None else DEFAULT_LON
-
-    data = _collect_basics(lat, lon)
-    weather, air = data.get("weather") or {}, data.get("air") or {}
-    score, level = score_risk(weather, air)
-    color = level_to_color(level)
-
-    # Persistência best-effort
-    try:
-        save_weather(lat, lon, weather, raw=weather)
-        save_air(lat, lon, "openaq", None, air, raw=air)
-        save_fire(lat, lon, "inpe_csv", payload=data.get("focos"))
-    except Exception:
-        pass
-
-    # Linha NDJSON “last state” (para gráficos do front)
-    try:
-        class _SR:
-            score = score
-            level = level
-            breakdown = None
-        _append_alerta_ndjson("global", _SR, {"meta": {
-            "pm25": air.get("pm25"),
-            "pm10": air.get("pm10"),
-            "precipitation": weather.get("precipitation"),
-            "wind_speed_10m": weather.get("wind_speed_10m"),
-            "observed_at": weather.get("observed_at"),
-            "focos_count": ((data.get("focos") or {}).get("features") or {}).get("count"),
-        }})
-    except Exception:
-        pass
-
-    # KPI Água (placeholder)
-    kpi_agua = {
-        "status": "indisponível",
-        "motivo": "Integração ANA não implementada/instável",
-        "level": "Amarelo",
-        "color": level_to_color("Amarelo"),
-        "dados": [],
-    }
-
-    return {
-        "ok": True,
-        "coords": {"lat": lat, "lon": lon},
-        "score": score,
-        "level": level,
-        "color": color,
-        "blocks": {
-            "weather": weather,
-            "air": air,
-            "fire": (data.get("focos") or {}).get("features") or {},
-            "agua": kpi_agua,
-        }
-    }
