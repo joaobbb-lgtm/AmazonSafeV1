@@ -1,88 +1,50 @@
 # main.py — extraído automaticamente do notebook AmazonSafe_API_v5.ipynb
-# Gerado para deploy no Railway.
+# Gerado para deploy (Render/Railway).
 # Observações:
-# - Linhas com magics do Jupyter (!, %, get_ipython) foram removidas.
-# - O Railway executa:  uvicorn main:app --host 0.0.0.0 --port ${PORT}
-# - Se quiser usar PostgreSQL do Railway, defina a env var DATABASE_URL no painel do Railway.
-# - Caso contrário, o fallback é SQLite local (arquivo amazonsafe.db).
+# - Magics do Jupyter (!, %, get_ipython) removidos.
+# - O processo inicia com:  uvicorn main:app --host 0.0.0.0 --port ${PORT}
+# - Para Postgres, defina DATABASE_URL; caso contrário, usa SQLite local.
 
 import os
+import sys
+import math
+import csv
+import io
+import json
+import time
+import threading
+import datetime as dt
+
+# DB/Engine
 from sqlmodel import create_engine, SQLModel
 
-# Fallback de banco: Railway Postgres -> SQLite
+# Fallback de banco: Railway/Render Postgres -> SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# Garantir create_all no startup do FastAPI (se os modelos já estiverem definidos quando app subir)
-# Dica: defina @app.on_event("startup") no seu código principal para chamar
-# ==== [cell] =============================================
-# @title Setup de dependências (Colab/Notebook)
-# Se estiver em Colab, isto instala os pacotes necessários.
-# Em outras máquinas, use:  install -U sqlmodel "SQLAlchemy>=2" "pydantic>=2,<3" fastapi uvicorn[standard] requests pandas
-
-
-# Cria as tabelas no banco, se não existirem
-# ==== [cell] =============================================
-
-import sys, subprocess, pkgutil
-
-def pip_install(pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", *pkgs])
-
-need = []
-
-# Tabelinha de versões compatíveis:
-# - sqlmodel >= 0.0.14  (compatível com Pydantic v2 e SQLAlchemy v2)
-# - SQLAlchemy >= 2.0
-# - pydantic >= 2,<3
-# - fastapi >= 0.115
-# - uvicorn[standard] >= 0.30
-# - requests, pandas para os coletores
-
-if pkgutil.find_loader("sqlmodel") is None:
-    need += ["sqlmodel>=0.0.14"]
-
-# Garantir compat com SA v2 / Pydantic v2 / FastAPI recente
-need += [
-    "SQLAlchemy>=2.0",
-    "pydantic>=2,<3",
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-    "requests>=2.31",
-    "pandas>=2.2",
-]
-
-# Opcional: utilidades de rede e desempenho
-need += [
-    "orjson>=3.9",
-    "python-dotenv>=1.0",
-]
-
-# Instala apenas se houver algo faltando
-if need:
-    print("Instalando pacotes:", need)
-    _install(need)
-else:
-    print("Todos os pacotes principais já estão instalados.")
-
-# Validação rápida dos imports
-import sqlmodel, sqlalchemy, pydantic, fastapi, uvicorn, requests, pandas  # noqa
-print("OK: sqlmodel", sqlmodel.__version__,
-      "| SQLAlchemy", sqlalchemy.__version__,
-      "| pydantic", pydantic.__version__)
-
-# ===== Imports básicos =====
-import os, math, csv, io, json, time, threading, datetime as dt
-import requests, pandas as pd
+# ===== Imports de terceiros (fixados via requirements.txt) =====
+# Log de versões (opcional) para diagnóstico
+try:
+    import sqlmodel, sqlalchemy, pydantic, fastapi, requests, pandas  # noqa
+    print("OK: sqlmodel", sqlmodel.__version__,
+          "| SQLAlchemy", sqlalchemy.__version__,
+          "| pydantic", pydantic.__version__)
+except Exception as e:
+    print("AVISO: alguma dependência pode estar faltando:", e)
 
 # FastAPI / server
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-# DB
-from typing import Optional, List, Dict, Any, Tuple
-from sqlmodel import SQLModel, Field, Session, create_engine, select
+# Tipos e SQLModel
+from typing import Optional, List, Dict, Any, Tuple, Literal
+from sqlmodel import Field, Session, select
+
+# HTTP clients / Data
+import requests
+import pandas as pd
+import httpx  # usado nos adapters/resolver de qualidade do ar
 
 # === Grupo 2: Análise/IA ===
 from analytics.features import build_features
@@ -90,22 +52,13 @@ from analytics.rules import classify_by_rules
 from analytics.model import predict, MODEL_VERSION
 
 # JSON rápido (orjson se disponível)
-import json
 try:
     import orjson
     _json_dumps = lambda obj: orjson.dumps(obj).decode("utf-8")
 except Exception:
     _json_dumps = lambda obj: json.dumps(obj, ensure_ascii=False)
 
-# >>> AIR-IMPORTS-START
-from typing import Optional, Dict, Any, Tuple
-import os, math, time
-import httpx
-# >>> AIR-IMPORTS-END
-
-
 # --- NDJSON de alertas (para Grupo 3/4 lerem sem SQL) ---
-
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 ALERTAS_NDJSON_PATH = os.path.join(DATA_DIR, "alertas.ndjson")
@@ -149,15 +102,12 @@ DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-1.4558"))
 DEFAULT_LON = float(os.getenv("DEFAULT_LON", "-48.5039"))
 
 # OpenAQ v3
-OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "f6713d7b945cc5d989cdc08bcb44b62c0f343f11e0f1080555d0b768283ce101")  # já está com sua chave no ambiente
+OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "f6713d7b945cc5d989cdc08bcb44b62c0f343f11e0f1080555d0b768283ce101")
 
 # ANA (SOAP antigo para inventário)
 ANA_SOAP_BASE = "https://telemetriaws1.ana.gov.br/ServiceANA.asmx"
 
 # INPE (Queimadas) - CSV (dataserver COIDS)
-# Exemplos de paths válidos:
-#   Diário (Brasil):  {INPE_CSV_BASE}/diario/Brasil/focos_diario_br_YYYYMMDD.csv
-#   Mensal (Brasil):  {INPE_CSV_BASE}/mensal/Brasil/focos_mensal_br_YYYYMM.csv
 INPE_CSV_BASE = os.getenv(
     "INPE_CSV_BASE",
     "https://dataserver-coids.inpe.br/queimadas/queimadas/focos/csv"
@@ -171,7 +121,7 @@ INPE_DEFAULT_REGION = os.getenv("INPE_DEFAULT_REGION", "Brasil")        # "Brasi
 CACHE_TTL_SEC = 300
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
-# Limiares/weights do score de risco
+# Limiares/weights do score de risco (mantidos para compat)
 PM25_LIMIT = 35
 PM10_LIMIT = 50
 PRECIP_GOOD_MM = 5.0
@@ -181,7 +131,7 @@ WEIGHT_DRY  = 30
 THRESHOLD_YELLOW = 40
 THRESHOLD_RED    = 70
 
-# Timezone/UTC helper (evita DeprecationWarning de utcnow)
+# Timezone/UTC helper
 UTC = dt.timezone.utc
 def now_utc():
     return dt.datetime.now(UTC)
@@ -191,8 +141,7 @@ print("Config ok.",
       "\n- INPE_DEFAULT_SCOPE:", INPE_DEFAULT_SCOPE,
       "\n- INPE_DEFAULT_REGION:", INPE_DEFAULT_REGION)
 
-## OpenWeatherMap - Config de chave
-# Aqui a chave já está fixa (para simplificar no Colab)
+# OpenWeatherMap - Config de chave
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
 # >>> AIR-CONFIG-START
@@ -201,6 +150,7 @@ AIR_STALE_MINUTES = int(os.getenv("AIR_STALE_MINUTES", "180"))
 AIR_RADIUS_SEQ = os.getenv("AIR_RADIUS_SEQ", "10000,25000,50000,75000")
 AIR_ENABLE_MODEL_FALLBACK = os.getenv("AIR_ENABLE_MODEL_FALLBACK", "1") == "1"
 # >>> AIR-CONFIG-END
+
 
 # ==== [cell] =============================================
 ## 1) Utilitários (cache TTL, geocoder, haversine, helpers)
