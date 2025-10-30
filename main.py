@@ -1,21 +1,3 @@
-# ==== BOOT MARKER ====
-print("BOOT AmazonSafe main.py @", __file__)
-
-# ==== HOTFIX: se algum trecho antigo tentar usar _install, neutraliza ====
-def _install(*args, **kwargs):
-    try:
-        print("SKIP runtime install (hotfix). args:", args)
-    except Exception:
-        pass
-
-    try:
-        with open(__file__, "r", encoding="utf-8") as _f:
-            _head = "".join([next(_f) for _ in range(12)])
-        print("BOOT HEAD (12 linhas iniciais):\n", _head)
-    except Exception as _e:
-        print("BOOT HEAD: <não foi possível ler>", _e)
-
-
 # main.py — extraído automaticamente do notebook AmazonSafe_API_v5.ipynb
 # Gerado para deploy (Render/Railway).
 # Observações:
