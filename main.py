@@ -192,73 +192,137 @@ def cache_stats():
     return {"entries": sum(len(getattr(v, "_cache", {})) for v in globals().values() if callable(v))}
 
 
-# --- Geocoding robusto (Nominatim + fallback Open-Meteo) ---
-from typing import Literal
+# --- Geocoding robusto: Nominatim + fallback Open-Meteo ---------------------
+import re
+from typing import Optional
 
-GEOCODE_UA = "AmazonSafe/3 (+https://amazonsafe-api.onrender.com)"
-GEOCODE_TIMEOUT = min(HTTP_TIMEOUT, 15)
+GEOCODE_UA = "AmazonSafe/3 (+https://amazonsafe-api.onrender.com; contato: seu-email@exemplo)"
+UF2STATE = {
+    "AC":"Acre","AL":"Alagoas","AP":"Amapá","AM":"Amazonas","BA":"Bahia","CE":"Ceará",
+    "DF":"Distrito Federal","ES":"Espírito Santo","GO":"Goiás","MA":"Maranhão","MT":"Mato Grosso",
+    "MS":"Mato Grosso do Sul","MG":"Minas Gerais","PA":"Pará","PB":"Paraíba","PR":"Paraná",
+    "PE":"Pernambuco","PI":"Piauí","RJ":"Rio de Janeiro","RN":"Rio Grande do Norte",
+    "RS":"Rio Grande do Sul","RO":"Rondônia","RR":"Roraima","SC":"Santa Catarina",
+    "SP":"São Paulo","SE":"Sergipe","TO":"Tocantins"
+}
 
-def _geocode_nominatim(q: str) -> dict | None:
-    url = "https://nominatim.openstreetmap.org/search"
+def _split_city_state(q: str) -> tuple[str, Optional[str]]:
+    # aceita "Palmas, TO" | "Palmas - TO" | "Palmas TO"
+    s = q.strip()
+    m = re.split(r"\s*[,;-]\s*|\s{2,}", s, maxsplit=1)
+    if len(m) == 2:
+        city, st = m[0].strip(), m[1].strip()
+        return city, st
+    return s, None
+
+def _normalize_state(st: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not st: return None, None
+    up = st.strip().upper()
+    if up in UF2STATE:    # UF -> nome
+        return up, UF2STATE[up]
+    # pode ter vindo o nome do estado já
+    for uf, name in UF2STATE.items():
+        if up.lower() == name.lower():
+            return uf, name
+    return None, st
+
+def _geocode_nominatim(q: str, state_name: Optional[str]) -> Optional[dict]:
+    import requests as _rq
+    base = "https://nominatim.openstreetmap.org/search"
+    headers = {"User-Agent": GEOCODE_UA, "Accept": "application/json"}
+    # tente variantes com viés BR
+    variants = []
+    if state_name:
+        variants += [f"{q}, {state_name}, Brasil", f"{q}, {state_name}, BR"]
+    variants += [f"{q}, Brasil", f"{q}, BR", q]
+
+    for txt in variants:
+        try:
+            r = _rq.get(
+                base,
+                params={"q": txt, "format": "jsonv2", "addressdetails": 1, "limit": 5, "countrycodes": "br"},
+                headers=headers,
+                timeout=HTTP_TIMEOUT,
+            )
+            r.raise_for_status()
+            arr = r.json() or []
+            if not arr:
+                continue
+            # escolha a melhor: se state_name foi pedido, prioriza quem bate o estado
+            best = None; best_score = -1
+            for it in arr:
+                lat = it.get("lat"); lon = it.get("lon")
+                if not lat or not lon: 
+                    continue
+                score = 1
+                if state_name:
+                    addr = it.get("address") or {}
+                    nm = (addr.get("state") or addr.get("region") or "").lower()
+                    if state_name.lower() in nm:
+                        score += 2
+                if score > best_score:
+                    best, best_score = it, score
+            if best:
+                return {
+                    "lat": float(best["lat"]),
+                    "lon": float(best["lon"]),
+                    "display_name": best.get("display_name") or q,
+                    "source": "nominatim",
+                }
+        except Exception:
+            # tenta a próxima variante / fallback
+            pass
+    return None
+
+def _geocode_open_meteo(q: str, state_name: Optional[str]) -> Optional[dict]:
+    import requests as _rq
+    base = "https://geocoding-api.open-meteo.com/v1/search"
     try:
-        r = requests.get(
-            url,
-            params={
-                "q": q,
-                "format": "jsonv2",
-                "addressdetails": 1,
-                "limit": 1,
-                "accept-language": "pt-BR",
-            },
-            headers={"User-Agent": GEOCODE_UA, "Accept": "application/json"},
-            timeout=GEOCODE_TIMEOUT,
-        )
-        r.raise_for_status()
-        js = r.json() or []
-        if not js:
-            return None
-        it = js[0]
-        return {
-            "lat": float(it["lat"]),
-            "lon": float(it["lon"]),
-            "display_name": it.get("display_name"),
-            "provider": "nominatim",
-        }
-    except Exception as e:
-        print("[warn] geocode nominatim:", e)
-        return None
-
-def _geocode_open_meteo(q: str) -> dict | None:
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    try:
-        r = requests.get(
-            url,
-            params={"name": q, "count": 1, "language": "pt", "format": "json"},
-            headers={"User-Agent": GEOCODE_UA, "Accept": "application/json"},
-            timeout=GEOCODE_TIMEOUT,
+        r = _rq.get(
+            base,
+            params={"name": q, "count": 10, "language": "pt", "format": "json", "country": "BR"},
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": GEOCODE_UA},
         )
         r.raise_for_status()
         js = r.json() or {}
-        results = js.get("results") or []
-        if not results:
+        arr = js.get("results") or []
+        if not arr:
             return None
-        it = results[0]
-        display = ", ".join([p for p in [it.get("name"), it.get("admin1"), it.get("country")] if p])
-        return {
-            "lat": float(it["latitude"]),
-            "lon": float(it["longitude"]),
-            "display_name": display or q,
-            "provider": "open-meteo",
-        }
-    except Exception as e:
-        print("[warn] geocode open-meteo:", e)
-        return None
+        # prioriza match do estado (admin1)
+        best = None; best_score = -1
+        for it in arr:
+            score = 1
+            if state_name and (it.get("admin1") or "").lower() == state_name.lower():
+                score += 2
+            if score > best_score:
+                best, best_score = it, score
+        if best:
+            disp = f"{best.get('name')}, {best.get('admin1') or ''}, {best.get('country') or 'Brasil'}".strip(", ")
+            return {"lat": float(best["latitude"]), "lon": float(best["longitude"]), "display_name": disp, "source": "open-meteo"}
+    except Exception:
+        pass
+    return None
 
-def geocode_city(q: str) -> dict | None:
-    res = _geocode_nominatim(q)
+def geocode_city(raw_q: str) -> Optional[dict]:
+    if not raw_q or not raw_q.strip():
+        return None
+    city, st = _split_city_state(raw_q)
+    uf, state_name = _normalize_state(st)
+    q = city
+    # 1) tenta Nominatim com bias Brasil
+    res = _geocode_nominatim(q, state_name)
     if res:
         return res
-    return _geocode_open_meteo(q)
+    # 2) fallback Open-Meteo
+    res = _geocode_open_meteo(q, state_name)
+    if res:
+        return res
+    # 3) última cartada: tenta city + "Brasil" em Nominatim sem state
+    res = _geocode_nominatim(city, None)
+    return res
+# ---------------------------------------------------------------------------
+
 
 
 # Distância geodésica aproximada (km)
