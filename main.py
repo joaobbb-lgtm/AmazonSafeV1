@@ -308,14 +308,31 @@ def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT):
 # ---------------------------
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
 def get_open_meteo(lat: float, lon: float, timeout: int = HTTP_TIMEOUT) -> dict:
+    """
+    Busca:
+      - current: temperatura/umidade/vento (instantâneo)
+      - hourly: precipitation (para somar últimas 24h)
+      - daily: precipitation_sum (fallback)
+    Tudo em UTC para evitar ambiguidade; normalização cuida do 24h.
+    """
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": lat, "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
-        "timezone": "UTC"
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": "UTC",
+        # instantâneo (continua útil para outros KPIs):
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
+        # série horária para acumulado 24h:
+        "hourly": "precipitation",
+        # série diária como fallback rápido:
+        "daily": "precipitation_sum",
+        # traz passado recente + hoje (garante termos as últimas 24h)
+        "past_days": 2,
+        "forecast_days": 1,
     }
     r = http_get(url, params=params, timeout=timeout)
     return r.json()
+
 
 # ---------------------------
 # OpenAQ v3
@@ -771,23 +788,82 @@ def _canonical_unit(unit: str | None, param: str | None) -> str | None:
     if u in {"ug/m3", "µg/m3", "μg/m3"}: return "µg/m³"
     return unit
 
-def normalize_open_meteo(data: dict) -> dict:
-    cur = (data or {}).get("current") or {}
-    units_from_api = (data or {}).get("current_units") or {}
-    units = {
-        "temperature_2m": units_from_api.get("temperature_2m", "°C"),
-        "relative_humidity_2m": units_from_api.get("relative_humidity_2m", "%"),
-        "precipitation": units_from_api.get("precipitation", "mm"),
-        "wind_speed_10m": units_from_api.get("wind_speed_10m", "km/h"),
-    }
-    out = {
-        "temperature_2m": cur.get("temperature_2m"),
-        "relative_humidity_2m": cur.get("relative_humidity_2m"),
-        "precipitation": cur.get("precipitation"),
-        "wind_speed_10m": cur.get("wind_speed_10m"),
-        "observed_at": cur.get("time"),
-        "meta": {"units": units}
-    }
+# Helper p/ parse ISO em UTC
+def _parse_iso_utc(s: str):
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+        return dt.datetime.fromisoformat(s).astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+def normalize_open_meteo(resp: dict) -> dict:
+    """
+    Normaliza Open-Meteo:
+      - temperature_2m, relative_humidity_2m, wind_speed_10m (instantâneo)
+      - precipitation  = ACUMULADO 24h (mm)  ← usado no KPI/score
+      - observed_at    = timestamp do 'current'
+      - meta.units     = unidades combinadas (current/hourly/daily)
+    Requer que get_open_meteo peça 'hourly=precipitation' e 'daily=precipitation_sum'.
+    """
+    if not isinstance(resp, dict):
+        return {"meta": {"units": {}}}
+
+    out = {"meta": {"units": {}}}
+
+    # --- current (instantâneo)
+    cur = (resp.get("current") or {})
+    out["temperature_2m"] = cur.get("temperature_2m")
+    out["relative_humidity_2m"] = cur.get("relative_humidity_2m")
+    out["wind_speed_10m"] = cur.get("wind_speed_10m")
+    out["observed_at"] = cur.get("time")
+
+    # --- units (combina as disponibilizadas)
+    units = {}
+    for k in ("current_units", "hourly_units", "daily_units"):
+        u = resp.get(k) or {}
+        if isinstance(u, dict):
+            units.update(u)
+    out["meta"]["units"] = units
+
+    # --- acumulado 24h preferindo série horária
+    precip_24h = None
+    hourly = resp.get("hourly") or {}
+    hrs_time = hourly.get("time") or []
+    hrs_prec = hourly.get("precipitation") or []
+
+    if hrs_time and hrs_prec and len(hrs_time) == len(hrs_prec):
+        now_ts = _parse_iso_utc(out["observed_at"]) or _parse_iso_utc(hrs_time[-1]) or dt.datetime.now(dt.timezone.utc)
+        start = now_ts - dt.timedelta(hours=24)
+
+        total = 0.0
+        for t_str, val in zip(hrs_time, hrs_prec):
+            ts = _parse_iso_utc(t_str)
+            if ts is None:
+                continue
+            if start < ts <= now_ts:
+                try:
+                    v = float(val)
+                except Exception:
+                    v = 0.0
+                if v > 0:
+                    total += v
+        precip_24h = round(total, 2)
+
+    # --- fallback diário (pega o dia mais recente)
+    if precip_24h is None:
+        daily = resp.get("daily") or {}
+        d_sum = daily.get("precipitation_sum") or []
+        if d_sum:
+            try:
+                precip_24h = round(float(d_sum[-1]), 2)
+            except Exception:
+                precip_24h = 0.0
+
+    # Se nada veio, deixa 0.0 (front trata)
+    out["precipitation"] = precip_24h if precip_24h is not None else 0.0
     return out
 
 def normalize_openaq_v3_latest(latest: dict, sensors: dict | None = None) -> dict:
@@ -1468,6 +1544,25 @@ def health():
 
 # ========= DEBUG: schema das tabelas =========
 from sqlalchemy import inspect, text
+
+@app.get("/debug/openmeteo_raw")
+def debug_openmeteo_raw(lat: float, lon: float):
+    raw = get_open_meteo(lat, lon, timeout=HTTP_TIMEOUT)
+    norm = normalize_open_meteo(raw)
+
+    hourly = (raw or {}).get("hourly") or {}
+    hrs_time = hourly.get("time") or []
+    hrs_prec = hourly.get("precipitation") or []
+    tail = list(zip(hrs_time[-6:], hrs_prec[-6:]))
+
+    return {
+        "observed_at": norm.get("observed_at"),
+        "precip_24h_norm": norm.get("precipitation"),
+        "hourly_tail": tail,   # últimos 6 pontos (hora, precip)
+        "counts": {"hourly_time": len(hrs_time), "hourly_prec": len(hrs_prec)},
+        "units": (raw or {}).get("hourly_units") or {},
+    }
+
 
 @app.get("/debug/alertobs_schema", tags=["Infra"])
 def debug_alertobs_schema():
