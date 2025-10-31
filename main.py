@@ -2392,44 +2392,38 @@ def _is_valid_pm25(x: Optional[float]) -> bool:
 # Helpers locais
 # -------------------------
 
+def _as_float_or_none(x):
+    if x is None:
+        return None
+    if isinstance(x, str):
+        x = x.strip()
+        if not x:
+            return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
 def _resolve_location(cidade: Optional[str], lat: Optional[float], lon: Optional[float]) -> tuple[float, float, dict]:
-    """
-    Resolve (lat, lon, meta) sem nunca lançar exceção.
-    Prioridade: coordenadas explícitas > geocode(cidade) > defaults.
-    """
-    # 1) Coordenadas explícitas vencem
-    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-        try:
-            return float(lat), float(lon), {"resolved_by": "direct_params"}
-        except Exception:
-            # se algo muito estranho acontecer na conversão, cai pro fallback abaixo
-            pass
+    lat = _as_float_or_none(lat)
+    lon = _as_float_or_none(lon)
 
-    # 2) Tentar geocodificar a cidade (se fornecida)
-    if (cidade or "").strip():
-        try:
-            info = geocode_city(cidade)  # sua função atual (ou a versão com Open-Meteo)
-            if info and "lat" in info and "lon" in info:
-                return float(info["lat"]), float(info["lon"]), {
-                    "resolved_by": "geocode",
-                    "display_name": info.get("display_name") or cidade
-                }
-            # geocode não retornou coords — degrade para defaults
-            return float(DEFAULT_LAT), float(DEFAULT_LON), {
-                "resolved_by": "fallback_default",
-                "input": cidade,
-                "reason": "geocode_no_coords"
-            }
-        except Exception as e:
-            # Nunca quebra: usa defaults e registra o erro
-            return float(DEFAULT_LAT), float(DEFAULT_LON), {
-                "resolved_by": "fallback_default",
-                "input": cidade,
-                "error": (str(e) or "geocode_error")[:200]
-            }
+    # 1) Se cidade foi informada, ela manda (independente de lat/lon)
+    if cidade:
+        info = geocode_city(cidade)
+        if not info:
+            raise HTTPException(status_code=404, detail=f"Não foi possível geocodificar a cidade '{cidade}'.")
+        return float(info["lat"]), float(info["lon"]), {
+            "resolved_by": "geocode",
+            "display_name": info.get("display_name")
+        }
 
-    # 3) Sem coords nem cidade: defaults
-    return float(DEFAULT_LAT), float(DEFAULT_LON), {"resolved_by": "fallback_default"}
+    # 2) Senão, usa lat/lon se ambas válidas
+    if lat is not None and lon is not None:
+        return lat, lon, {"resolved_by": "direct_params"}
+
+    # 3) Fallback: defaults
+    return float(DEFAULT_LAT), float(DEFAULT_LON), {"resolved_by": "default"}
 
 
 def _collect_weather(lat: float, lon: float, provider: Literal["open-meteo", "owm"] = "open-meteo") -> dict:
