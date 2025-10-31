@@ -192,18 +192,73 @@ def cache_stats():
     return {"entries": sum(len(getattr(v, "_cache", {})) for v in globals().values() if callable(v))}
 
 
-# Geocoder simples (Nominatim) — se você já tem um, use o seu
-@ttl_cache(ttl_seconds=3600)
-def geocode_city(cidade: str) -> dict | None:
+# --- Geocoding robusto (Nominatim + fallback Open-Meteo) ---
+from typing import Literal
+
+GEOCODE_UA = "AmazonSafe/3 (+https://amazonsafe-api.onrender.com)"
+GEOCODE_TIMEOUT = min(HTTP_TIMEOUT, 15)
+
+def _geocode_nominatim(q: str) -> dict | None:
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": cidade, "format": "json", "limit": 1}
-    r = requests.get(url, params=params, headers={"User-Agent": "Awa/1.0"}, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    arr = r.json()
-    if not arr:
+    try:
+        r = requests.get(
+            url,
+            params={
+                "q": q,
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "limit": 1,
+                "accept-language": "pt-BR",
+            },
+            headers={"User-Agent": GEOCODE_UA, "Accept": "application/json"},
+            timeout=GEOCODE_TIMEOUT,
+        )
+        r.raise_for_status()
+        js = r.json() or []
+        if not js:
+            return None
+        it = js[0]
+        return {
+            "lat": float(it["lat"]),
+            "lon": float(it["lon"]),
+            "display_name": it.get("display_name"),
+            "provider": "nominatim",
+        }
+    except Exception as e:
+        print("[warn] geocode nominatim:", e)
         return None
-    it = arr[0]
-    return {"lat": float(it["lat"]), "lon": float(it["lon"]), "display_name": it["display_name"]}
+
+def _geocode_open_meteo(q: str) -> dict | None:
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    try:
+        r = requests.get(
+            url,
+            params={"name": q, "count": 1, "language": "pt", "format": "json"},
+            headers={"User-Agent": GEOCODE_UA, "Accept": "application/json"},
+            timeout=GEOCODE_TIMEOUT,
+        )
+        r.raise_for_status()
+        js = r.json() or {}
+        results = js.get("results") or []
+        if not results:
+            return None
+        it = results[0]
+        display = ", ".join([p for p in [it.get("name"), it.get("admin1"), it.get("country")] if p])
+        return {
+            "lat": float(it["latitude"]),
+            "lon": float(it["longitude"]),
+            "display_name": display or q,
+            "provider": "open-meteo",
+        }
+    except Exception as e:
+        print("[warn] geocode open-meteo:", e)
+        return None
+
+def geocode_city(q: str) -> dict | None:
+    res = _geocode_nominatim(q)
+    if res:
+        return res
+    return _geocode_open_meteo(q)
 
 
 # Distância geodésica aproximada (km)
