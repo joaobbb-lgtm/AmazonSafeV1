@@ -2988,43 +2988,49 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
 
         # 3) IA (opcional) — não deve bloquear o restante
         try:
-            obs_ai = {
+            # Payload no formato esperado por models.ai_model.predict
+            ai_payload = {
+                # o ai_model.py lê weather.features / air.features
                 "weather": (weather or {}).get("features") or {},
                 "air":     (air or {}).get("features") or {},
-                "inpe":    (focos or {}).get("features") or {},
+                # IMPORTANTE: a chave deve ser "focos" (não "inpe")
+                "focos":   (focos or {}).get("features") or {},
+                # ele também tenta usar score.breakdown.precip_24h_mm (se existir)
+                "score":   {"breakdown": sr.breakdown or {}},
             }
-            feat = build_features(obs_ai)
+
+            # baseline por regras (mantemos para comparação/telemetria)
+            feat = build_features({
+                "weather": ai_payload["weather"],
+                "air":     ai_payload["air"],
+                # aqui as regras esperam a chave "inpe", então reaproveitamos
+                "inpe":    ai_payload["focos"],
+            })
             alerta_rules, pred_rules = classify_by_rules(feat)
 
-            # analytics.model.predict recebe o dict de features e
-            # retorna (label, {label:proba,...}) ou None
-            pred = predict(feat)
-
-            if pred:
-                alerta_final, proba = pred
-                pred_json = {
-                    "modelo": MODEL_VERSION,
-                    "proba":  proba,
-                    "features": feat,
-                    "baseline": pred_rules
-                }
+            # IA treinada (ou fallback interno do ai_model)
+            ai_res = ai_predict(ai_payload)  # -> {"modelo","label","proba",{...features...}}
+            if isinstance(ai_res, dict) and ai_res.get("label"):
+                alerta_final = ai_res["label"]
+                pred_json = {**ai_res, "baseline": pred_rules}
             else:
+                # fallback: usar só regras caso a IA não retorne algo válido
                 alerta_final = alerta_rules
-                pred_json = {
-                    "modelo": "rules_v1",
-                    "proba":  pred_rules.get("p", {}),
-                    "features": feat
-                }
+                pred_json = {"modelo": "rules_v1", "proba": pred_rules.get("p", {}), "features": feat}
 
-            score_payload["ai_alert"] = alerta_final
+            score_payload["ai_alert"] = {"label": alerta_final}
             score_payload["ai_pred"]  = pred_json
+
+            # anexa um espelho dentro do alert_obs (não quebra se não existir)
             try:
                 alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
             except Exception:
                 pass
 
         except Exception as _ai_err:
+            # IA falhou? apenas registra; não interrompe o fluxo
             score_payload["ai_error"] = str(_ai_err)
+
 
         # 4) Identificador do alerta (sempre)
         alert_id = (body.cidade or f"geo:{lat:.4f},{lon:.4f}").strip()
