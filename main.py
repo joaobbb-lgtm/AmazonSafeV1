@@ -47,10 +47,12 @@ import requests
 import pandas as pd
 import httpx  # usado nos adapters/resolver de qualidade do ar
 
-# === Grupo 2: Análise/IA ===
-from analytics.features import build_features
-from analytics.rules import classify_by_rules
-from analytics.model import predict, MODEL_VERSION
+# === Análise/IA ===
+from analytics.features import build_features                  
+from analytics.rules   import classify_by_rules                
+from models.ai_model   import predict as ai_predict            
+MODEL_VERSION = "rf_v1"                                        
+
 
 # JSON rápido (orjson se disponível)
 try:
@@ -2870,8 +2872,6 @@ if "compute_alert_score" not in globals():
                 "precip_24h_mm": float(precip_24h) if precip_24h is not None else None,
             },
         )
-# ================== FIM DO BLOCO DE GARANTIA ==================
-
 # -------------------------
 # POST /api/alertas_update (persistência + score/nível)
 # -------------------------
@@ -2918,8 +2918,14 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     # -------- Weather --------
     weather = {}
     try:
-        weather = _collect_weather(lat, lon, provider=body.weather_provider)  # mantém sua função
-        save_weather(lat, lon, weather.get("features") or {}, weather.get("payload"))
+        weather = _collect_weather(lat, lon, provider=body.weather_provider)
+        # >>> FIX 1: passar a fonte também
+        save_weather(
+            lat, lon,
+            weather.get("fonte") or body.weather_provider,
+            weather.get("features") or {},
+            weather.get("payload")
+        )
         persisted["weather"] += 1
     except Exception as e:
         errors["weather"] = str(e)
@@ -2941,11 +2947,17 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "estimated": bool(air_dict.get("estimated")),
             "radius_m": air_dict.get("radius_m"),
             "station": air_dict.get("station"),
-            "features": {"pm25": air_dict.get("pm25")}  # compat com o front antigo
+            "features": {"pm25": air_dict.get("pm25")}
         }
-        # Persistência leve (mantém a tabela/NDJSON compatível com seu fluxo atual)
+        # >>> FIX 2: location_id INT e feats = features
         try:
-            save_air(lat, lon, air.get("source") or "openaq/model", air.get("station"), air, raw=air)
+            save_air(
+                lat, lon,
+                air.get("source") or "openaq/model",
+                (air.get("station") or {}).get("id"),           # <- int ou None
+                air.get("features") or {},                       # <- só as features
+                raw=air                                          # <- payload completo para auditoria
+            )
         except Exception:
             pass
         persisted["air"] += 1
@@ -2967,7 +2979,7 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         # 1) Observação consolidada
         alert_obs = build_alert_obs(
             weather_features=(weather or {}).get("features") or {},
-            air_features=(air or {}).get("features") or {},     # usa o PM2.5 padronizado
+            air_features=(air or {}).get("features") or {},
             fire_features=(focos or {}).get("features") or {},
         )
 
@@ -2983,14 +2995,26 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             }
             feat = build_features(obs_ai)
             alerta_rules, pred_rules = classify_by_rules(feat)
-            pred = predict(feat)  # -> (label, {label:proba,...}) ou None
+
+            # analytics.model.predict recebe o dict de features e
+            # retorna (label, {label:proba,...}) ou None
+            pred = predict(feat)
 
             if pred:
                 alerta_final, proba = pred
-                pred_json = {"modelo": MODEL_VERSION, "proba": proba, "features": feat, "baseline": pred_rules}
+                pred_json = {
+                    "modelo": MODEL_VERSION,
+                    "proba":  proba,
+                    "features": feat,
+                    "baseline": pred_rules
+                }
             else:
                 alerta_final = alerta_rules
-                pred_json = {"modelo": "rules_v1", "proba": pred_rules.get("p", {}), "features": feat}
+                pred_json = {
+                    "modelo": "rules_v1",
+                    "proba":  pred_rules.get("p", {}),
+                    "features": feat
+                }
 
             score_payload["ai_alert"] = alerta_final
             score_payload["ai_pred"]  = pred_json
@@ -3000,7 +3024,6 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
                 pass
 
         except Exception as _ai_err:
-            # IA falhou? Só registra o erro; não interrompe o fluxo
             score_payload["ai_error"] = str(_ai_err)
 
         # 4) Identificador do alerta (sempre)
@@ -3042,15 +3065,14 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "score": sr.score,
             "level": sr.level,
             "level_color": level_to_color(sr.level),
-            "breakdown": sr.breakdown,   # <- ESSENCIAL
+            "breakdown": sr.breakdown,
             "alert_obs": alert_obs
         })
 
-        # Fallbacks leves p/ não deixar vazio
         score_payload.setdefault("ai_alert", {"label": "desconhecido"})
         score_payload.setdefault("ai_pred", {"modelo": "none", "proba": {}, "features": {}})
 
-        # Status do KPI de AR com base no resolver (não confundir com "água")
+        # Status do KPI de AR
         score_payload["air_status"] = air_status
 
         persisted["alert_score"] += 1
@@ -3074,10 +3096,10 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "limit": body.limit,
         },
         "weather": (weather or {}).get("features") or {},
-        "air_status": air_status,         # <- novo campo explícito
-        "air":      air or {},            # <- estrutura padronizada com pm25/source/etc
+        "air_status": air_status,
+        "air":      air or {},
         "focos":    (focos or {}).get("features") or {},
-        "score": score_payload,           # inclui score, level, breakdown, alert_obs, IA e air_status
+        "score": score_payload,
         "persisted": persisted,
         "errors": errors,
     }
