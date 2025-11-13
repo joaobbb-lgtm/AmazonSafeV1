@@ -2184,6 +2184,13 @@ def api_demo_risk(
     units = ((a or {}).get("meta") or {}).get("units") or {}
     return {"weather": w, "air": a, "score": score, "level": level, "units": units}
 
+
+
+@app.get("/api/check_model")
+def check_model():
+    from models.ai_model import has_model, MODEL_PATH
+    return {"exists": has_model(), "path": MODEL_PATH}
+
 # ------------------------------------------------------------------------------
 # Index
 # ------------------------------------------------------------------------------
