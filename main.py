@@ -5,7 +5,6 @@
 # - O processo inicia com:  uvicorn main:app --host 0.0.0.0 --port ${PORT}
 # - Para Postgres, defina DATABASE_URL; caso contrário, usa SQLite local.
 
-
 import os
 import sys
 import math
