@@ -10,3 +10,4 @@ venv/
 amazonsafe.db
 mnt/
 data/
+*.joblib
