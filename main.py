@@ -3119,23 +3119,15 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import numpy as np
 import joblib
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+import numpy as np
 
+# ⚠️ Garanta que o app ainda esteja instanciado no seu arquivo!
 app = FastAPI()
 
-# ⚠️ Garanta que o modelo esteja nesse caminho no seu servidor!
-MODEL_PATH = "models/random_forest_amazonsafe.joblib"
+# ✅ Carrega o pipeline completo treinado (modelo + imputer + scaler)
+pipeline = joblib.load("models/amazonsafe_pipeline.joblib")
 
-# Carregar modelo e inicializar processadores (mesmos do treino!)
-modelo = joblib.load(MODEL_PATH)
-imputer = joblib.load("models/imputer_amazonsafe.joblib")
-scaler = joblib.load("models/scaler_amazonsafe.joblib")
-
-
-# 🔽 Modelo de entrada da API
 class EntradaModelo(BaseModel):
     chuva_mm: float
     pm25: float | None = None
@@ -3156,16 +3148,10 @@ def prever_risco(entrada: EntradaModelo):
             entrada.focos
         ]]
 
-        # Imputação + normalização
-        X_imputado = imputer.transform(entrada_lista)
-        X_escalado = scaler.transform(X_imputado)
-
-        # Predição
-        predicao = modelo.predict(X_escalado)[0]
+        predicao = pipeline.predict(entrada_lista)[0]
         descricao = {0: "Risco Verde", 1: "Risco Amarelo", 2: "Risco Vermelho"}[predicao]
 
         return {"risco_predito": int(predicao), "descricao": descricao}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
