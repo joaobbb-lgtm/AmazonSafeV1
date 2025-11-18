@@ -48,8 +48,7 @@ import httpx  # usado nos adapters/resolver de qualidade do ar
 
 # === Análise/IA ===
 from analytics.features import build_features                  
-from analytics.rules   import classify_by_rules                
-from models.ai_model   import predict as ai_predict            
+from analytics.rules   import classify_by_rules               
 MODEL_VERSION = "rf_v1"                                        
 
 
