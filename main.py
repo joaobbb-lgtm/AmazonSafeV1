@@ -3116,3 +3116,62 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         "errors": errors,
     }
 
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import numpy as np
+import joblib
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
+app = FastAPI()
+
+# ⚠️ Garanta que o modelo esteja nesse caminho no seu servidor!
+MODEL_PATH = "models/random_forest_amazonsafe.joblib"
+
+# Carregar modelo e inicializar processadores (mesmos do treino!)
+modelo = joblib.load(MODEL_PATH)
+imputer = SimpleImputer(strategy="mean")
+scaler = StandardScaler()
+
+# Simulação do fit do imputer e scaler com valores médios do treino
+# (Ideal: persistir os objetos ou refazer com X_train real)
+# Exemplo com valores médios aproximados:
+media_treino = np.array([[15.0, 40.0, 60.0, 2.5, 10.0, 5.0]])  # média hipotética
+imputer.fit(media_treino)
+scaler.fit(imputer.transform(media_treino))
+
+# 🔽 Modelo de entrada da API
+class EntradaModelo(BaseModel):
+    chuva_mm: float
+    pm25: float | None = None
+    pm10: float | None = None
+    vento_m_s: float
+    frp: float
+    focos: int
+
+@app.post("/api/ai_score")
+def prever_risco(entrada: EntradaModelo):
+    try:
+        entrada_lista = [[
+            entrada.chuva_mm,
+            entrada.pm25,
+            entrada.pm10,
+            entrada.vento_m_s,
+            entrada.frp,
+            entrada.focos
+        ]]
+
+        # Imputação + normalização
+        X_imputado = imputer.transform(entrada_lista)
+        X_escalado = scaler.transform(X_imputado)
+
+        # Predição
+        predicao = modelo.predict(X_escalado)[0]
+        descricao = {0: "Risco Verde", 1: "Risco Amarelo", 2: "Risco Vermelho"}[predicao]
+
+        return {"risco_predito": int(predicao), "descricao": descricao}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
