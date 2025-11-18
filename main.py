@@ -3131,15 +3131,9 @@ MODEL_PATH = "models/random_forest_amazonsafe.joblib"
 
 # Carregar modelo e inicializar processadores (mesmos do treino!)
 modelo = joblib.load(MODEL_PATH)
-imputer = SimpleImputer(strategy="mean")
-scaler = StandardScaler()
+imputer = joblib.load("models/imputer_amazonsafe.joblib")
+scaler = joblib.load("models/scaler_amazonsafe.joblib")
 
-# Simulação do fit do imputer e scaler com valores médios do treino
-# (Ideal: persistir os objetos ou refazer com X_train real)
-# Exemplo com valores médios aproximados:
-media_treino = np.array([[15.0, 40.0, 60.0, 2.5, 10.0, 5.0]])  # média hipotética
-imputer.fit(media_treino)
-scaler.fit(imputer.transform(media_treino))
 
 # 🔽 Modelo de entrada da API
 class EntradaModelo(BaseModel):
