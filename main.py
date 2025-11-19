@@ -2991,48 +2991,57 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         # 2) Score por regras
         sr = compute_alert_score(alert_obs)
 
-        # 3) IA (opcional) — não deve bloquear o restante
-        try:
-            # Payload no formato esperado por models.ai_model.predict
-            ai_payload = {
-                # o ai_model.py lê weather.features / air.features
-                "weather": (weather or {}).get("features") or {},
-                "air":     (air or {}).get("features") or {},
-                # IMPORTANTE: a chave deve ser "focos" (não "inpe")
-                "focos":   (focos or {}).get("features") or {},
-                # ele também tenta usar score.breakdown.precip_24h_mm (se existir)
-                "score":   {"breakdown": sr.breakdown or {}},
+        # --- IA COM NOVO PIPELINE ------------------------------------
+    try:
+        # O pipeline espera vetores numéricos: chuva, pm25, pm10, vento, frp, focos
+    
+        weather_f = (weather or {}).get("features") or {}
+        air_f     = (air or {}).get("features") or {}
+        fire_f    = (focos or {}).get("features") or {}
+    
+        # Extrair características com fallback para 0 caso não exista
+        X_model = [[
+            weather_f.get("chuva_mm", 0),
+            air_f.get("pm25", 0),
+            air_f.get("pm10", 0),
+            weather_f.get("vento_m_s", 0),
+            fire_f.get("frp", 0),
+            fire_f.get("focos", 0),
+        ]]
+    
+        # Rodar o pipeline
+        pred = pipeline.predict(X_model)[0]
+        proba = pipeline.predict_proba(X_model)[0].tolist() if hasattr(pipeline, "predict_proba") else []
+    
+        labels = {0: "verde", 1: "amarelo", 2: "vermelho"}
+        alerta_final = labels.get(int(pred), "desconhecido")
+    
+        pred_json = {
+            "modelo": "pipeline_v1",
+            "label": alerta_final,
+            "proba": proba,
+            "features": {
+                "chuva_mm": X_model[0][0],
+                "pm25":     X_model[0][1],
+                "pm10":     X_model[0][2],
+                "vento_m_s": X_model[0][3],
+                "frp":       X_model[0][4],
+                "focos":     X_model[0][5],
             }
+        }
+    
+        score_payload["ai_alert"] = {"label": alerta_final}
+        score_payload["ai_pred"] = pred_json
+    
+        # espelho dentro do alert_obs
+        try:
+            alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
+        except:
+            pass
+    
+    except Exception as _ai_err:
+        score_payload["ai_error"] = str(_ai_err)
 
-            # baseline por regras (mantemos para comparação/telemetria)
-            feat = build_features({
-                "weather": ai_payload["weather"],
-                "air":     ai_payload["air"],
-                # aqui as regras esperam a chave "inpe", então reaproveitamos
-                "inpe":    ai_payload["focos"],
-            })
-            alerta_rules, pred_rules = classify_by_rules(feat)
-
-            # IA treinada (ou fallback interno do ai_model)
-            ai_res = ai_predict(ai_payload)  # -> {"modelo","label","proba",{...features...}}
-            if isinstance(ai_res, dict) and ai_res.get("label"):
-                alerta_final = ai_res["label"]
-                pred_json = {**ai_res, "baseline": pred_rules}
-            else:
-                # fallback: usar só regras caso a IA não retorne algo válido
-                alerta_final = alerta_rules
-                pred_json = {"modelo": "rules_v1", "proba": pred_rules.get("p", {}), "features": feat}
-
-            score_payload["ai_alert"] = {"label": alerta_final}
-            score_payload["ai_pred"]  = pred_json
-
-            # anexa um espelho dentro do alert_obs (não quebra se não existir)
-            try:
-                alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
-            except Exception:
-                pass
-
-        except Exception as _ai_err:
             # IA falhou? apenas registra; não interrompe o fluxo
             score_payload["ai_error"] = str(_ai_err)
 
