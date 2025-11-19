@@ -50,7 +50,8 @@ import httpx  # usado nos adapters/resolver de qualidade do ar
 from analytics.features import build_features                  
 from analytics.rules   import classify_by_rules               
 MODEL_VERSION = "rf_v1"                                        
-
+# ⚠️ Garanta que o app ainda esteja instanciado no seu arquivo!
+app = FastAPI()
 
 # JSON rápido (orjson se disponível)
 try:
@@ -3107,12 +3108,6 @@ from pydantic import BaseModel
 import joblib
 import numpy as np
 
-# ⚠️ Garanta que o app ainda esteja instanciado no seu arquivo!
-app = FastAPI()
-
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 # ✅ Carrega o pipeline completo treinado (modelo + imputer + scaler)
 pipeline = joblib.load("models/amazonsafe_pipeline.joblib")
