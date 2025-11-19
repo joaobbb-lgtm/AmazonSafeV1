@@ -3110,6 +3110,10 @@ import numpy as np
 # ⚠️ Garanta que o app ainda esteja instanciado no seu arquivo!
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 # ✅ Carrega o pipeline completo treinado (modelo + imputer + scaler)
 pipeline = joblib.load("models/amazonsafe_pipeline.joblib")
 
