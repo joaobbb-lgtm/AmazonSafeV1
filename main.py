@@ -2935,13 +2935,7 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     except Exception as e:
         errors["weather"] = str(e)
 
-    # -------- Air (resolver com raio progressivo + fallback de modelo) --------
-    # Estrutura padronizada esperada pelo front:
-    #   air_status ∈ {"ok", "sem_estacao", "sem_dado"}
-    #   air = {
-    #     "pm25": <float|null>, "source": "station|model", "estimated": bool,
-    #     "radius_m": <int|null>, "station": {...}, "features": {"pm25": <...>}
-    #   }
+        # -------- Air (resolver com raio progressivo + fallback de modelo) --------
     air = {}
     air_status = "sem_dado"
     try:
@@ -2954,14 +2948,13 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
             "station": air_dict.get("station"),
             "features": {"pm25": air_dict.get("pm25")}
         }
-        # >>> FIX 2: location_id INT e feats = features
         try:
             save_air(
                 lat, lon,
                 air.get("source") or "openaq/model",
-                (air.get("station") or {}).get("id"),           # <- int ou None
-                air.get("features") or {},                       # <- só as features
-                raw=air                                          # <- payload completo para auditoria
+                (air.get("station") or {}).get("id"),
+                air.get("features") or {},
+                raw=air
             )
         except Exception:
             pass
@@ -2981,75 +2974,62 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
     # ---- Score & Persistência do alerta --------------------------------------
     score_payload = {}
     try:
-        # 1) Observação consolidada
         alert_obs = build_alert_obs(
             weather_features=(weather or {}).get("features") or {},
             air_features=(air or {}).get("features") or {},
             fire_features=(focos or {}).get("features") or {},
         )
 
-        # 2) Score por regras
         sr = compute_alert_score(alert_obs)
 
         # --- IA COM NOVO PIPELINE ------------------------------------
-    try:
-        # O pipeline espera vetores numéricos: chuva, pm25, pm10, vento, frp, focos
-    
-        weather_f = (weather or {}).get("features") or {}
-        air_f     = (air or {}).get("features") or {}
-        fire_f    = (focos or {}).get("features") or {}
-    
-        # Extrair características com fallback para 0 caso não exista
-        X_model = [[
-            weather_f.get("chuva_mm", 0),
-            air_f.get("pm25", 0),
-            air_f.get("pm10", 0),
-            weather_f.get("vento_m_s", 0),
-            fire_f.get("frp", 0),
-            fire_f.get("focos", 0),
-        ]]
-    
-        # Rodar o pipeline
-        pred = pipeline.predict(X_model)[0]
-        proba = pipeline.predict_proba(X_model)[0].tolist() if hasattr(pipeline, "predict_proba") else []
-    
-        labels = {0: "verde", 1: "amarelo", 2: "vermelho"}
-        alerta_final = labels.get(int(pred), "desconhecido")
-    
-        pred_json = {
-            "modelo": "pipeline_v1",
-            "label": alerta_final,
-            "proba": proba,
-            "features": {
-                "chuva_mm": X_model[0][0],
-                "pm25":     X_model[0][1],
-                "pm10":     X_model[0][2],
-                "vento_m_s": X_model[0][3],
-                "frp":       X_model[0][4],
-                "focos":     X_model[0][5],
-            }
-        }
-    
-        score_payload["ai_alert"] = {"label": alerta_final}
-        score_payload["ai_pred"] = pred_json
-    
-        # espelho dentro do alert_obs
         try:
-            alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
-        except:
-            pass
-    
-    except Exception as _ai_err:
-        score_payload["ai_error"] = str(_ai_err)
+            weather_f = (weather or {}).get("features") or {}
+            air_f     = (air or {}).get("features") or {}
+            fire_f    = (focos or {}).get("features") or {}
 
-            # IA falhou? apenas registra; não interrompe o fluxo
+            X_model = [[
+                weather_f.get("chuva_mm", 0),
+                air_f.get("pm25", 0),
+                air_f.get("pm10", 0),
+                weather_f.get("vento_m_s", 0),
+                fire_f.get("frp", 0),
+                fire_f.get("focos", 0),
+            ]]
+
+            pred = pipeline.predict(X_model)[0]
+            proba = pipeline.predict_proba(X_model)[0].tolist() if hasattr(pipeline, "predict_proba") else []
+
+            labels = {0: "verde", 1: "amarelo", 2: "vermelho"}
+            alerta_final = labels.get(int(pred), "desconhecido")
+
+            pred_json = {
+                "modelo": "pipeline_v1",
+                "label": alerta_final,
+                "proba": proba,
+                "features": {
+                    "chuva_mm": X_model[0][0],
+                    "pm25":     X_model[0][1],
+                    "pm10":     X_model[0][2],
+                    "vento_m_s": X_model[0][3],
+                    "frp":       X_model[0][4],
+                    "focos":     X_model[0][5],
+                }
+            }
+
+            score_payload["ai_alert"] = {"label": alerta_final}
+            score_payload["ai_pred"] = pred_json
+
+            try:
+                alert_obs["ai"] = {"alerta": alerta_final, "predicao": pred_json}
+            except Exception:
+                pass
+
+        except Exception as _ai_err:
             score_payload["ai_error"] = str(_ai_err)
 
-
-        # 4) Identificador do alerta (sempre)
         alert_id = (body.cidade or f"geo:{lat:.4f},{lon:.4f}").strip()
 
-        # 5) Persistência e transição (sempre)
         save_alert_score(
             alert_id=alert_id,
             score=sr.score,
@@ -3079,7 +3059,6 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
 
         _append_alerta_ndjson(alert_id, sr, alert_obs)
 
-        # 6) Preenche payload para o front (sempre)
         score_payload.update({
             "alert_id": alert_id,
             "score": sr.score,
@@ -3091,8 +3070,6 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
 
         score_payload.setdefault("ai_alert", {"label": "desconhecido"})
         score_payload.setdefault("ai_pred", {"modelo": "none", "proba": {}, "features": {}})
-
-        # Status do KPI de AR
         score_payload["air_status"] = air_status
 
         persisted["alert_score"] += 1
@@ -3117,8 +3094,8 @@ def api_alertas_update(body: AlertasUpdateBody = Body(...)):
         },
         "weather": (weather or {}).get("features") or {},
         "air_status": air_status,
-        "air":      air or {},
-        "focos":    (focos or {}).get("features") or {},
+        "air": air or {},
+        "focos": (focos or {}).get("features") or {},
         "score": score_payload,
         "persisted": persisted,
         "errors": errors,
