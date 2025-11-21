@@ -823,7 +823,7 @@ NOTIFY_DEBOUNCE_SEC = int(os.getenv("NOTIFY_DEBOUNCE_SEC", "600"))
 WEBHOOK_URL = os.getenv("ALERTS_WEBHOOK_URL")
 
 def _ensure_alerts_dir():
-    d = "/mnt/data/alerts"
+    d = "./runtime_data/alerts"
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -2119,8 +2119,8 @@ router_logs = APIRouter(prefix="/logs", tags=["Logs"])
 # ------------------------------------------------------------
 # 14.1 — Garantir diretório de logs
 # ------------------------------------------------------------
-def _ensure_logs_dir() -> str:
-    d = "/mnt/data/logs"
+def _ensure_logs_dir():
+    d = os.path.join(os.path.dirname(__file__), "runtime_data")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -2336,10 +2336,10 @@ def api_health_geocode():
 # ------------------------------------------------------------
 # 15.5 — Testar escrita mínima em disco (Render / Vercel)
 # ------------------------------------------------------------
-@router_health.get("/health/disk", summary="Testa escrita no disco persistente (/mnt/data)")
+@router_health.get("/health/disk", summary="Testa escrita no disco persistente (./runtime_data)")
 def api_health_disk():
     try:
-        d = "/mnt/data/healthcheck"
+        d = "./runtime_data/healthcheck"
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "test.txt")
         ts = now_utc().isoformat()
