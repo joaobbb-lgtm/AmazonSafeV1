@@ -1081,12 +1081,97 @@ MODEL_FEATURES = [
     "winddirection_10m",
     "windgusts_10m",
     "precipitation",
-    "shortwave_radiation",         # rad_solar
-    "direct_normal_irradiance",    # rad_direta
+    "shortwave_radiation",
+    "direct_normal_irradiance",
     "evapotranspiration",
     "soil_temperature_0cm",
     "soil_moisture_0_to_1cm",
 ]
+
+# =======================================================
+# ⭐️ 8.1.1 — NOVO ENDPOINT OFICIAL /api/risk
+# =======================================================
+class RiskInput(BaseModel):
+    temperature_2m: float
+    relativehumidity_2m: float
+    dewpoint_2m: float
+    surface_pressure: float
+    windspeed_10m: float
+    winddirection_10m: float
+    windgusts_10m: float
+    precipitation: float
+    shortwave_radiation: float
+    direct_normal_irradiance: float
+    evapotranspiration: float
+    soil_temperature_0cm: float
+    soil_moisture_0_to_1cm: float
+    focos_50km: float
+    focos_150km: float
+    focos_300km: float
+
+
+@app.post("/api/risk", tags=["IA"], summary="Risco Ambiental — Pipeline Final AmazonSafe")
+def api_risk(data: RiskInput):
+    if modelo_pipeline is None:
+        raise HTTPException(status_code=500, detail="Modelo não carregado")
+
+    entrada = data.model_dump()
+
+    # Montagem na ordem usada no treinamento
+    row = [
+        entrada["temperature_2m"],
+        entrada["relativehumidity_2m"],
+        entrada["dewpoint_2m"],
+        entrada["surface_pressure"],
+        entrada["windspeed_10m"],
+        entrada["winddirection_10m"],
+        entrada["windgusts_10m"],
+        entrada["precipitation"],
+        entrada["shortwave_radiation"],
+        entrada["direct_normal_irradiance"],
+        entrada["evapotranspiration"],
+        entrada["soil_temperature_0cm"],
+        entrada["soil_moisture_0_to_1cm"],
+        entrada["focos_50km"],
+        entrada["focos_150km"],
+        entrada["focos_300km"],
+    ]
+
+    X = np.array([row], dtype=float)
+
+    # Previsão
+    try:
+        focos_prev = float(modelo_pipeline.predict(X)[0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar previsão: {e}")
+
+    # Risco simples (faixas do dataset)
+    if focos_prev <= 50:
+        risco_simples = "baixo"
+    elif focos_prev <= 150:
+        risco_simples = "medio"
+    else:
+        risco_simples = "alto"
+
+    # Score híbrido (temperatura + focos)
+    temp = entrada["temperature_2m"]
+    score_h = (temp / 40) + (focos_prev / 300)
+
+    if score_h <= 1:
+        risco_h = "baixo"
+    elif score_h <= 2:
+        risco_h = "medio"
+        risco_h
+    else:
+        risco_h = "alto"
+
+    return {
+        "entrada": entrada,
+        "focos_previstos_300km": focos_prev,
+        "risco_simples": risco_simples,
+        "score_hibrido": score_h,
+        "risco_hibrido": risco_h,
+    }
 
 # ------------------------------
 # 8.2 — COLETA CLIMÁTICA (Open-Meteo ARCHIVE)
