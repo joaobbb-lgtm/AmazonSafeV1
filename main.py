@@ -2204,6 +2204,9 @@ import numpy as np
 
 router_health = APIRouter(prefix="/system", tags=["Sistema"])
 
+
+
+
 # ------------------------------------------------------------
 # 16.0 — Helper UTC
 # ------------------------------------------------------------
@@ -2222,8 +2225,13 @@ def api_health():
         "model_loaded": modelo_pipeline is not None,
         "db_url": DB_URL,
     }
+# ------------------------------------------------------------
+# 16.1A — Healthcheck raiz (compatibilidade com Render)
+# ------------------------------------------------------------
 
-
+@app.get("/health", tags=["Sistema"], summary="Healthcheck raiz (compatibilidade)")
+def root_health():
+    return {"ok": True, "status": "online", "path": "/system/health"}
 # ------------------------------------------------------------
 # 16.2 — Teste rápido do modelo IA
 # ------------------------------------------------------------
