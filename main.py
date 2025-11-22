@@ -963,16 +963,16 @@ import datetime as dt
 import pandas as pd
 
 # ============================================================
-# 8.0 — CARREGAMENTO DO MODELO REGRESSOR v10
+# 8.0 — CARREGAMENTO DO PIPELINE FINAL AmazonSafe v10
 # ============================================================
 
-MODEL_PATH = "modelo_reg_focos300km_rf_v10.joblib"
+MODEL_PATH = "models/amazonsafe_pipeline_v10.joblib"
 
 try:
     modelo_pipeline = joblib.load(MODEL_PATH)
-    print(f"[IA] Modelo RandomForest v10 carregado de {MODEL_PATH}")
+    print(f"[IA] Modelo AmazonSafe v10 carregado de {MODEL_PATH}")
 except Exception as e:
-    print(f"[IA] ERRO ao carregar modelo v10: {e}")
+    print(f"[IA] ERRO ao carregar modelo AmazonSafe v10: {e}")
     modelo_pipeline = None
 
 # ============================================================
