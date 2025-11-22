@@ -263,97 +263,97 @@ def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT):
     return resp
 
 # ============================================================
-# 3.3 — Open-Meteo (Forecast)
+# 3.3 — Open-Meteo Forecast + Air Quality
 # ============================================================
 
-@ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def get_open_meteo(lat: float, lon: float, timeout: int = HTTP_TIMEOUT) -> dict:
-    url = "https://api.open-meteo.com/v1/forecast"
-    hourly_vars = [
-        "temperature_2m","relative_humidity_2m","dewpoint_2m",
-        "surface_pressure","wind_speed_10m","wind_direction_10m",
-        "wind_gusts_10m","precipitation","shortwave_radiation",
-        "direct_normal_irradiance"
-    ]
+def safe_mean(values):
+    if not isinstance(values, list):
+        return None
+    clean = [v for v in values if isinstance(v, (int, float))]
+    return sum(clean) / len(clean) if clean else None
 
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "timezone": "UTC",
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
-        "hourly": ",".join(hourly_vars),
-        "daily": "precipitation_sum",
-        "past_days": 2,
-        "forecast_days": 1,
-    }
-
-    r = http_get(url, params=params, timeout=timeout)
-    return r.json()
-
-# ============================================================
-# 3.4 — OpenAQ (PM2.5 / PM10)
-# ============================================================
-
-def openaq_headers():
-    if not OPENAQ_API_KEY:
-        raise RuntimeError("Defina OPENAQ_API_KEY no ambiente.")
-    return {"X-API-Key": OPENAQ_API_KEY}
 
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def openaq_locations(lat, lon, radius_m=10000, limit=5, timeout=HTTP_TIMEOUT):
-    radius_m = max(1000, min(int(radius_m), 25000))
-    url = "https://api.openaq.org/v3/locations"
-    params = {"coordinates": f"{lat:.6f},{lon:.6f}", "radius": radius_m, "limit": limit}
+def get_meteo(lat: float, lon: float, retries: int = 5):
+    """
+    Coleta:
+    - temperatura, umidade, ponto orvalho
+    - pressão
+    - vento, direção, rajadas
+    - precipitação
+    - radiação solar global e direta
+    - evapotranspiração
+    - solo temperatura e solo umidade
+    - PM10, PM2.5, O3, NO2, SO2, CO
+    - UV index
+    """
 
-    try:
-        r = http_get(url, params=params, headers=openaq_headers(), timeout=timeout)
-        out = r.json()
-        out["_used_radius"] = radius_m
-        return out
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", None)
-        if status in (408, 429, 500, 502, 503, 504):
-            r = http_get(
-                url,
-                params={"coordinates": f"{lat:.6f},{lon:.6f}", "radius": 25000, "limit": limit},
-                headers=openaq_headers(),
-                timeout=timeout,
-            )
-            out = r.json()
-            out["_used_radius"] = 25000
-            return out
-        raise
+    hourly_vars = ",".join([
+        "temperature_2m",
+        "relativehumidity_2m",
+        "dewpoint_2m",
+        "surface_pressure",
+        "windspeed_10m",
+        "winddirection_10m",
+        "windgusts_10m",
+        "precipitation",
+        "shortwave_radiation",
+        "direct_normal_irradiance",
+        "soil_temperature_0cm",
+        "soil_moisture_0_to_1cm",
+        "evapotranspiration"
+    ])
 
-# leituras "latest"
-@ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def openaq_latest_by_location_id(location_id: int, timeout=HTTP_TIMEOUT):
-    url = f"https://api.openaq.org/v3/locations/{location_id}/latest"
-    r = http_get(url, headers=openaq_headers(), timeout=timeout)
-    return r.json()
+    url_weather = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&hourly={hourly_vars}"
+        "&timezone=America%2FSao_Paulo"
+    )
 
-# sensores
-@ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def openaq_sensors_by_location_id(location_id: int, timeout=HTTP_TIMEOUT):
-    url = f"https://api.openaq.org/v3/locations/{location_id}/sensors"
-    r = http_get(url, headers=openaq_headers(), timeout=timeout)
-    return r.json()
+    url_air = (
+        "https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat}&longitude={lon}"
+        "&hourly=pm10,pm2_5,ozone,nitrogen_dioxide,"
+        "sulphur_dioxide,carbon_monoxide,uv_index"
+        "&timezone=America%2FSao_Paulo"
+    )
 
-# fallback "measurements"
-@ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def openaq_measurements_by_location_id(location_id, limit=100, recency_days=3, timeout=HTTP_TIMEOUT):
-    url = "https://api.openaq.org/v3/measurements"
-    date_to = dt.datetime.utcnow().isoformat() + "Z"
-    date_from = (dt.datetime.utcnow() - dt.timedelta(days=recency_days)).isoformat() + "Z"
-    params = {
-        "locations_id": location_id,
-        "parameters_id": "2,5",
-        "date_from": date_from,
-        "date_to": date_to,
-        "limit": limit,
-        "sort": "desc",
-    }
-    r = http_get(url, params=params, headers=openaq_headers(), timeout=timeout)
-    return r.json()
+    for attempt in range(1, retries + 1):
+        try:
+            # Clima
+            r1 = requests.get(url_weather, timeout=20)
+            r1.raise_for_status()
+            w = r1.json().get("hourly", {})
+
+            # Qualidade do ar
+            r2 = requests.get(url_air, timeout=20)
+            r2.raise_for_status()
+            a = r2.json().get("hourly", {})
+
+            clima = {}
+
+            # Forecast
+            for var in hourly_vars.split(","):
+                clima[var] = safe_mean(w.get(var))
+
+            # Air quality
+            clima["pm10"] = safe_mean(a.get("pm10"))
+            clima["pm25"] = safe_mean(a.get("pm2_5"))
+            clima["o3"]   = safe_mean(a.get("ozone"))
+            clima["no2"]  = safe_mean(a.get("nitrogen_dioxide"))
+            clima["so2"]  = safe_mean(a.get("sulphur_dioxide"))
+            clima["co"]   = safe_mean(a.get("carbon_monoxide"))
+            clima["uv"]   = safe_mean(a.get("uv_index"))
+
+            return clima
+
+        except Exception as e:
+            print(f"[METEO] Falha {attempt}/{retries}: {e}")
+            time.sleep(2)
+
+    print("[METEO] Falhou após todas tentativas.")
+    return {}
 
 # ============================================================
 # 3.5 — INPE (Queimadas)
@@ -485,126 +485,16 @@ def inpe_focos_near(lat, lon, raio_km=150, scope="diario", region="Brasil", limi
     }
 
 # ============================================================
-# 3.6 — NORMALIZADORES (Open-Meteo + OpenAQ)
+# 3.6 — NORMALIZADORES
 # ============================================================
 
-def _parse_iso_utc(s):
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
-        return dt.datetime.fromisoformat(s).astimezone(dt.timezone.utc)
-    except:
-        return None
-
-def normalize_open_meteo(resp: dict) -> dict:
-    if not isinstance(resp, dict):
-        return {"meta": {"units": {}}}
-
-    out = {"meta": {"units": {}}}
-
-    cur = resp.get("current") or {}
-    out["temperature_2m"] = cur.get("temperature_2m")
-    out["relative_humidity_2m"] = cur.get("relative_humidity_2m")
-    out["wind_speed_10m"] = cur.get("wind_speed_10m")
-    out["observed_at"] = cur.get("time")
-
-    units = {}
-    for k in ("current_units", "hourly_units", "daily_units"):
-        u = resp.get(k) or {}
-        if isinstance(u, dict):
-            units.update(u)
-    out["meta"]["units"] = units
-
-    # Precipitação 24h
-    precip_24h = None
-    hourly = resp.get("hourly") or {}
-    hrs_time = hourly.get("time") or []
-    hrs_prec = hourly.get("precipitation") or []
-
-    if hrs_time and len(hrs_time) == len(hrs_prec):
-        now_ts = _parse_iso_utc(out["observed_at"]) or _parse_iso_utc(hrs_time[-1])
-        start = now_ts - dt.timedelta(hours=24)
-
-        total = 0.0
-        for t_str, val in zip(hrs_time, hrs_prec):
-            ts = _parse_iso_utc(t_str)
-            if ts and start < ts <= now_ts:
-                total += float(val or 0)
-        precip_24h = round(total, 2)
-
-    if precip_24h is None:
-        daily = resp.get("daily") or {}
-        d_sum = daily.get("precipitation_sum") or []
-        if d_sum:
-            precip_24h = round(float(d_sum[-1]), 2)
-
-    out["precipitation"] = precip_24h or 0.0
-    return out
-
-# -------------------------
-# OpenAQ Normalizer
-# -------------------------
-
-def _param_name_to_str(param_obj):
-    if param_obj is None:
-        return ""
-    if isinstance(param_obj, str):
-        return param_obj.strip().lower()
-    if isinstance(param_obj, dict):
-        for k in ("id", "code", "name", "parameter", "slug"):
-            v = param_obj.get(k)
-            if isinstance(v, str):
-                return v.strip().lower()
-    return ""
-
-def _canonical_unit(unit: str | None, param: str | None):
-    if not unit:
-        if (param or "").lower() in {"t", "temp", "temperature"}:
-            return "°C"
-        return None
-
-    u = unit.strip().lower()
-    if u in {"c", "°c", "degc"}:
-        return "°C"
-    if u in {"percent", "%"}:
-        return "%"
-    if u in {"ug/m3", "µg/m3", "μg/m3"}:
-        return "µg/m³"
-    return unit
-
-def normalize_openaq_v3_latest(latest: dict, sensors: dict | None = None) -> dict:
-    vals = {"pm25": [], "pm10": []}
-    units = {}
-    last_local = None
-    last_utc = None
-
-    results = (latest or {}).get("results") or []
-    for it in results:
-        for m in it.get("measurements", []) or []:
-            param = _param_name_to_str(m.get("parameter"))
-            val = m.get("value")
-            if isinstance(val, (int, float)):
-                if param in {"pm25", "pm2.5"}:
-                    vals["pm25"].append(val)
-                    units["pm25"] = _canonical_unit(m.get("unit"), "pm25")
-                elif param == "pm10":
-                    vals["pm10"].append(val)
-                    units["pm10"] = _canonical_unit(m.get("unit"), "pm10")
-
-            last_local = m.get("lastUpdated") or last_local
-            last_utc = m.get("lastUpdatedUtc") or last_utc
-
-    out = {
-        "pm25": sum(vals["pm25"]) / len(vals["pm25"]) if vals["pm25"] else None,
-        "pm10": sum(vals["pm10"]) / len(vals["pm10"]) if vals["pm10"] else None,
-        "meta": {
-            "units": units,
-            "last_local": last_local,
-            "last_utc": last_utc,
-        }
-    }
+def normalize_meteo(data: dict) -> dict:
+    out = {}
+    for k, v in data.items():
+        try:
+            out[k] = float(v) if v is not None else None
+        except:
+            out[k] = None
     return out
 
 # ============================================================
@@ -661,7 +551,7 @@ def _now_utc():
     return dt.datetime.now(UTC)
 
 # ------------------------------------------------------------
-# MODELOS — corrigidos (fonte adicionada em WeatherObs)
+# MODELO UNIFICADO — WeatherObs (clima + solo + ar)
 # ------------------------------------------------------------
 
 class WeatherObs(SQLModel, table=True):
@@ -669,29 +559,42 @@ class WeatherObs(SQLModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     id: Optional[int] = Field(default=None, primary_key=True)
+
     lat: float
     lon: float
-    fonte: str = "open-meteo"       # <- NOVO!
-    temperature_2m: Optional[float] = None
-    relative_humidity_2m: Optional[float] = None
-    precipitation: Optional[float] = None
-    wind_speed_10m: Optional[float] = None
-    observed_at: dt.datetime = Field(default_factory=_now_utc)
-    raw_json: Optional[str] = None
+    fonte: str = "open-meteo"   # origem dos dados
 
+    # -----------------------------
+    # Clima (Open-Meteo Forecast)
+    # -----------------------------
+    temperatura: Optional[float] = None
+    umidade: Optional[float] = None
+    ponto_orvalho: Optional[float] = None
+    pressao: Optional[float] = None
 
-class AirObs(SQLModel, table=True):
-    __tablename__ = "airobs"
-    __table_args__ = {"extend_existing": True}
+    vento_m_s: Optional[float] = None
+    vento_dir: Optional[float] = None
+    rajadas: Optional[float] = None
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    lat: float
-    lon: float
-    fonte: str = "openaq"
-    location_id: Optional[int] = None
-    pm25: Optional[float] = None
+    chuva_mm: Optional[float] = None
+    rad_solar: Optional[float] = None
+    rad_direta: Optional[float] = None
+
+    solo_temp_0cm: Optional[float] = None
+    solo_umid_0_1cm: Optional[float] = None
+    evapotranspiracao: Optional[float] = None
+
+    # -----------------------------
+    # Qualidade do ar (Open-Meteo AQ)
+    # -----------------------------
     pm10: Optional[float] = None
-    units_json: Optional[str] = None
+    pm25: Optional[float] = None
+    o3: Optional[float] = None
+    no2: Optional[float] = None
+    so2: Optional[float] = None
+    co: Optional[float] = None
+    uv: Optional[float] = None
+
     observed_at: dt.datetime = Field(default_factory=_now_utc)
     raw_json: Optional[str] = None
 
@@ -723,48 +626,27 @@ class AlertObs(SQLModel, table=True):
 print("DB pronto: tabelas criadas/atualizadas em", DB_URL)
 
 # ------------------------------------------------------------
-# HELPERS DE INSERT (corrigidos)
+# HELPER PARA SALVAR WEATHER COMPLETO
 # ------------------------------------------------------------
 
 def save_weather(lat: float, lon: float, fonte: str,
-                 features: Dict[str, Any],
+                 clima: Dict[str, Any],
                  raw: Dict[str, Any] | None = None) -> int:
+    """
+    Salva no banco um registro completo de clima + solo + ar.
+    'clima' deve ser exatamente o dict vindo de normalize_meteo(get_meteo()).
+    """
 
+    # Monta o registro expandindo automaticamente as keys
     rec = WeatherObs(
         lat=lat,
         lon=lon,
         fonte=fonte,
-        temperature_2m=features.get("temperature_2m"),
-        relative_humidity_2m=features.get("relative_humidity_2m"),
-        precipitation=features.get("precipitation"),
-        wind_speed_10m=features.get("wind_speed_10m"),
+        **clima,
         observed_at=_now_utc(),
-        raw_json=json.dumps(raw or {}, ensure_ascii=False),
+        raw_json=json.dumps(raw or clima, ensure_ascii=False),
     )
-    with Session(engine) as sess:
-        sess.add(rec)
-        sess.commit()
-        sess.refresh(rec)
-        return rec.id
 
-
-def save_air(lat: float, lon: float, fonte: str, location_id: Optional[int],
-             features: Dict[str, Any] | None,
-             raw: Dict[str, Any] | None = None) -> int:
-
-    units = ((features or {}).get("meta") or {}).get("units") or {}
-
-    rec = AirObs(
-        lat=lat,
-        lon=lon,
-        fonte=fonte,
-        location_id=location_id,
-        pm25=(features or {}).get("pm25"),
-        pm10=(features or {}).get("pm10"),
-        units_json=json.dumps(units, ensure_ascii=False) if units else None,
-        observed_at=_now_utc(),
-        raw_json=json.dumps(raw or {}, ensure_ascii=False),
-    )
     with Session(engine) as sess:
         sess.add(rec)
         sess.commit()
@@ -782,31 +664,34 @@ def save_fire(lat: float, lon: float, fonte: str = "inpe_csv",
         payload=json.dumps(payload or {}, ensure_ascii=False),
         observed_at=_now_utc(),
     )
+
     with Session(engine) as sess:
         sess.add(rec)
         sess.commit()
         sess.refresh(rec)
         return rec.id
 
+
 # ------------------------------------------------------------
-# CONSULTAS
+# CONSULTAS (GETS SIMPLES)
 # ------------------------------------------------------------
 
 def get_last_weather():
     with Session(engine) as sess:
-        return sess.exec(select(WeatherObs).order_by(WeatherObs.id.desc()).limit(1)).first()
-
-def get_last_air():
-    with Session(engine) as sess:
-        return sess.exec(select(AirObs).order_by(AirObs.id.desc()).limit(1)).first()
+        return sess.exec(
+            select(WeatherObs).order_by(WeatherObs.id.desc()).limit(1)
+        ).first()
 
 def get_last_fire():
     with Session(engine) as sess:
-        return sess.exec(select(FireObs).order_by(FireObs.id.desc()).limit(1)).first()
+        return sess.exec(
+            select(FireObs).order_by(FireObs.id.desc()).limit(1)
+        ).first()
 
 
 # ------------------------------------------------------------
 # ALERTAS — eventos, score, armazenamento NDJSON
+# (Mantidos sem alteração)
 # ------------------------------------------------------------
 
 try:
@@ -822,10 +707,12 @@ except NameError:
 NOTIFY_DEBOUNCE_SEC = int(os.getenv("NOTIFY_DEBOUNCE_SEC", "600"))
 WEBHOOK_URL = os.getenv("ALERTS_WEBHOOK_URL")
 
+
 def _ensure_alerts_dir():
     d = "./runtime_data/alerts"
     os.makedirs(d, exist_ok=True)
     return d
+
 
 def save_alert_score(alert_id: str, score: float, level: str,
                      alert_obs: Dict[str, Any],
@@ -864,7 +751,6 @@ def _persist_level_event(alert_id: str, old_level: str, new_level: str, payload:
         print("[level_event] WARN:", e)
 
 
-
 def _notify_level_change(alert_id: str, old_level: str, new_level: str,
                          score: float, obs: dict):
 
@@ -872,6 +758,7 @@ def _notify_level_change(alert_id: str, old_level: str, new_level: str,
     last = _LAST_NOTIFY.get(alert_id, 0)
     if now - last < NOTIFY_DEBOUNCE_SEC:
         return
+
     _LAST_NOTIFY[alert_id] = now
 
     msg = {
@@ -880,7 +767,10 @@ def _notify_level_change(alert_id: str, old_level: str, new_level: str,
         "to": new_level,
         "score": score,
         "when": _now_utc().isoformat().replace("+00:00", "Z"),
-        "obs": {k: obs.get(k) for k in ("severity", "duration", "frequency", "impact")},
+        "obs": {
+            k: obs.get(k)
+            for k in ("severity", "duration", "frequency", "impact")
+        },
     }
 
     try:
@@ -894,9 +784,9 @@ def _notify_level_change(alert_id: str, old_level: str, new_level: str,
         print("[notify] WARN:", e)
 
 
-
 def handle_level_transition(alert_id: str, new_level: str, score: float,
-                            alert_obs: Dict[str, Any], extra: Dict[str, Any] | None = None,
+                            alert_obs: Dict[str, Any],
+                            extra: Dict[str, Any] | None = None,
                             notify_on_bootstrap: bool = False):
 
     old_level = (_LAST_LEVEL.get(alert_id) or {}).get("level")
@@ -916,7 +806,7 @@ def handle_level_transition(alert_id: str, new_level: str, score: float,
 
 
 # ------------------------------------------------------------
-# HELPERS GERAIS (local / ar)
+# HELPERS GERAIS (Mantidos)
 # ------------------------------------------------------------
 
 def safe_number(x, default=0.0):
@@ -949,47 +839,58 @@ def _is_valid_pm25(x):
     except:
         return False
 
+
 # ============================================================
-# MÓDULO 7 — Sistema de Risco Legado + Helpers de Localização
+# MÓDULO 7 — Sistema de Risco (Atualizado) + Helpers de Localização
 # ============================================================
 
 import time
 from fastapi import HTTPException
 
 # ------------------------------------------------------------
-# PARÂMETROS DO SISTEMA DE RISCO LEGADO
+# PARÂMETROS DO SISTEMA DE RISCO ATUALIZADO
 # ------------------------------------------------------------
 
-PM25_LIMIT = 35
-PM10_LIMIT = 50
-PRECIP_GOOD_MM = 5.0
+PM25_LIMIT = 35        # µg/m³
+PM10_LIMIT = 50        # µg/m³
+CHUVA_BAIXA_MM = 5.0   # mm
 
 WEIGHT_PM25 = 40
 WEIGHT_PM10 = 30
-WEIGHT_DRY  = 30
+WEIGHT_SECO = 30
 
 THRESHOLD_YELLOW = 40
 THRESHOLD_RED    = 70
 
 
-def score_risk(weather: dict, air: dict):
+def score_risk(meteo: dict):
     """
-    Sistema de risco legado baseado em:
-    - PM25
-    - PM10
-    - chuva (precipitação)
+    Sistema de risco simplificado baseado no dataset unificado:
+    Entrada:
+        meteo = dict retornado por normalize_meteo(get_meteo())
+
+    Variáveis usadas:
+        pm25, pm10, chuva_mm
+
+    Retorna:
+        score (0 a 100)
+        level ("Verde", "Amarelo", "Vermelho")
     """
-    pm25 = (air or {}).get("pm25") or 0
-    pm10 = (air or {}).get("pm10") or 0
-    rain = (weather or {}).get("precipitation") or 0
+
+    pm25 = meteo.get("pm25") or 0
+    pm10 = meteo.get("pm10") or 0
+    chuva = meteo.get("chuva_mm") or 0
 
     score = 0
+
     if pm25 >= PM25_LIMIT:
         score += WEIGHT_PM25
+
     if pm10 >= PM10_LIMIT:
         score += WEIGHT_PM10
-    if rain <= PRECIP_GOOD_MM:
-        score += WEIGHT_DRY
+
+    if chuva <= CHUVA_BAIXA_MM:
+        score += WEIGHT_SECO
 
     score = max(0, min(100, int(score)))
 
@@ -1004,7 +905,7 @@ def score_risk(weather: dict, air: dict):
 
 
 # ------------------------------------------------------------
-# HELPERS DE LOCALIZAÇÃO
+# HELPERS DE LOCALIZAÇÃO (mantidos, apenas reorganizados)
 # ------------------------------------------------------------
 
 def _as_float_or_none(x):
@@ -1016,17 +917,18 @@ def _as_float_or_none(x):
             return None
     try:
         return float(x)
-    except Exception:
+    except:
         return None
 
 
 def _resolve_location(cidade: Optional[str], lat: Optional[float], lon: Optional[float]):
     """
-    Regras de resolução:
-    1) Se cidade foi passada → geocodifica com precisão
-    2) Senão se há lat/lon → usa diretamente
-    3) Senão → fallback para Belém (default)
+    Regras:
+    1) Se cidade foi passada → geocodifica
+    2) Se há lat/lon → usa diretamente
+    3) Senão → fallback para DEFAULT_LAT/LON
     """
+
     lat = _as_float_or_none(lat)
     lon = _as_float_or_none(lon)
 
@@ -1039,213 +941,215 @@ def _resolve_location(cidade: Optional[str], lat: Optional[float], lon: Optional
             )
         return float(info["lat"]), float(info["lon"]), {
             "resolved_by": "geocode",
-            "display_name": info.get("display_name")
+            "display_name": info.get("display_name"),
         }
 
     if lat is not None and lon is not None:
         return lat, lon, {"resolved_by": "direct_params"}
 
-    # fallback Belém
+    # fallback: Belém
     return float(DEFAULT_LAT), float(DEFAULT_LON), {"resolved_by": "default"}
 
+
 # ============================================================
-# 🧩 MÓDULO 8 — IA AmazonSafe (RandomForest + Open-Meteo Archive)
+# 🧩 MÓDULO 8 — IA AmazonSafe v10 (RandomForest)
 # ============================================================
 
 from pydantic import BaseModel
 import joblib
 import numpy as np
-import math
-import datetime as dt
 from fastapi import HTTPException
+import datetime as dt
+import pandas as pd
 
-# ------------------------------
-# 8.1 — CONFIG / CARREGAMENTO DO MODELO
-# ------------------------------
-MODEL_PATH = "models/amazonsafe_pipeline.joblib"
+# ============================================================
+# 8.0 — CARREGAMENTO DO MODELO REGRESSOR v10
+# ============================================================
+
+MODEL_PATH = "modelo_reg_focos300km_rf_v10.joblib"
 
 try:
     modelo_pipeline = joblib.load(MODEL_PATH)
-    print(f"[IA] Modelo AmazonSafe carregado de {MODEL_PATH}")
+    print(f"[IA] Modelo RandomForest v10 carregado de {MODEL_PATH}")
 except Exception as e:
-    print(f"[IA] ERRO ao carregar modelo AmazonSafe: {e}")
+    print(f"[IA] ERRO ao carregar modelo v10: {e}")
     modelo_pipeline = None
 
-# Ordem EXATA das features usadas no treinamento
+# ============================================================
+# 8.1 — FEATURES EXATAS UTILIZADAS NO TREINAMENTO
+# ============================================================
+# Essas são TODAS as colunas do dataset_scaled v10 após remover:
+# cidade, uf, focos_50km, focos_150km, focos_300km
+
 MODEL_FEATURES = [
-    "temperature_2m",
-    "relativehumidity_2m",
-    "dewpoint_2m",
-    "surface_pressure",
-    "windspeed_10m",
-    "winddirection_10m",
-    "windgusts_10m",
-    "precipitation",
-    "shortwave_radiation",
-    "direct_normal_irradiance",
-    "evapotranspiration",
-    "soil_temperature_0cm",
-    "soil_moisture_0_to_1cm",
+    "latitude",
+    "longitude",
+    "temperatura",
+    "umidade",
+    "ponto_orvalho",
+    "pressao",
+    "vento_m_s",
+    "vento_dir",
+    "rajadas",
+    "chuva_mm",
+    "rad_solar",
+    "rad_direta",
+    "solo_temp_0cm",
+    "solo_umid_0_1cm",
+    "evapotranspiracao",
+    "pm10",
+    "pm25",
+    "o3",
+    "no2",
+    "so2",
+    "co",
+    "uv"
 ]
 
-# =======================================================
-# ⭐️ 8.1.1 — NOVO ENDPOINT OFICIAL /api/risk
-# =======================================================
+# ============================================================
+# 8.2 — MODELO DO PAYLOAD /api/risk
+# ============================================================
+
 class RiskInput(BaseModel):
-    temperature_2m: float
-    relativehumidity_2m: float
-    dewpoint_2m: float
-    surface_pressure: float
-    windspeed_10m: float
-    winddirection_10m: float
-    windgusts_10m: float
-    precipitation: float
-    shortwave_radiation: float
-    direct_normal_irradiance: float
-    evapotranspiration: float
-    soil_temperature_0cm: float
-    soil_moisture_0_to_1cm: float
-    focos_50km: float
-    focos_150km: float
-    focos_300km: float
+    latitude: float
+    longitude: float
+    temperatura: float
+    umidade: float
+    ponto_orvalho: float
+    pressao: float
+    vento_m_s: float
+    vento_dir: float
+    rajadas: float
+    chuva_mm: float
+    rad_solar: float
+    rad_direta: float
+    solo_temp_0cm: float
+    solo_umid_0_1cm: float
+    evapotranspiracao: float
+    pm10: float
+    pm25: float
+    o3: float
+    no2: float
+    so2: float
+    co: float
+    uv: float
 
 
-@app.post("/api/risk", tags=["IA"], summary="Risco Ambiental — Pipeline Final AmazonSafe")
+# ============================================================
+# 8.3 — ENDPOINT OFICIAL /api/risk (PREVISÃO)
+# ============================================================
+
+@app.post("/api/risk", tags=["IA"], summary="Previsão focos_300km e risco ambiental (v10)")
 def api_risk(data: RiskInput):
+
     if modelo_pipeline is None:
-        raise HTTPException(status_code=500, detail="Modelo não carregado")
+        raise HTTPException(status_code=500, detail="Modelo v10 não carregado")
 
     entrada = data.model_dump()
 
-    # Montagem na ordem usada no treinamento
-    row = [
-        entrada["temperature_2m"],
-        entrada["relativehumidity_2m"],
-        entrada["dewpoint_2m"],
-        entrada["surface_pressure"],
-        entrada["windspeed_10m"],
-        entrada["winddirection_10m"],
-        entrada["windgusts_10m"],
-        entrada["precipitation"],
-        entrada["shortwave_radiation"],
-        entrada["direct_normal_irradiance"],
-        entrada["evapotranspiration"],
-        entrada["soil_temperature_0cm"],
-        entrada["soil_moisture_0_to_1cm"],
-        entrada["focos_50km"],
-        entrada["focos_150km"],
-        entrada["focos_300km"],
-    ]
+    # monta o vetor na ordem exata do treinamento
+    try:
+        row = [entrada[col] for col in MODEL_FEATURES]
+    except KeyError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Variável ausente no payload: {str(e)}"
+        )
 
     X = np.array([row], dtype=float)
 
-    # Previsão
+    # previsão
     try:
         focos_prev = float(modelo_pipeline.predict(X)[0])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao gerar previsão: {e}")
 
-    # Risco simples (faixas do dataset)
+    # classificação simples
     if focos_prev <= 50:
-        risco_simples = "baixo"
+        risco = "baixo"
     elif focos_prev <= 150:
-        risco_simples = "medio"
+        risco = "medio"
     else:
-        risco_simples = "alto"
-
-    # Score híbrido (temperatura + focos)
-    temp = entrada["temperature_2m"]
-    score_h = (temp / 40) + (focos_prev / 300)
-
-    if score_h <= 1:
-        risco_h = "baixo"
-    elif score_h <= 2:
-        risco_h = "medio"
-        risco_h
-    else:
-        risco_h = "alto"
+        risco = "alto"
 
     return {
+        "modelo": {
+            "path": MODEL_PATH,
+            "features": MODEL_FEATURES,
+        },
         "entrada": entrada,
         "focos_previstos_300km": focos_prev,
-        "risco_simples": risco_simples,
-        "score_hibrido": score_h,
-        "risco_hibrido": risco_h,
+        "risco_classificado": risco,
     }
 
-# ------------------------------
-# 8.2 — COLETA CLIMÁTICA (Open-Meteo ARCHIVE)
-# ------------------------------
-def collect_weather_archive(
-    lat: float,
-    lon: float,
-    ref_date: str,
-    max_retries: int = 4,
-    timeout: int = 20,
-) -> dict | None:
+# ============================================================
+# 8.4 — COLETA CLIMÁTICA DO ARCHIVE (para estudos e validação)
+# ============================================================
+
+def collect_weather_archive(lat: float, lon: float, ref_date: str, timeout: int = 20):
     """
-    Busca clima horário na data ref_date usando a API ARCHIVE do Open-Meteo
-    e calcula a MÉDIA diária das variáveis usadas no treinamento.
+    Busca clima horário no Open-Meteo ARCHIVE e calcula a média diária
+    das features usadas no treinamento do modelo.
     """
-    variables = MODEL_FEATURES.copy()
-    hourly_vars = ",".join(variables)
+
+    vars_str = ",".join([
+        "temperature_2m",
+        "relative_humidity_2m",
+        "dewpoint_2m",
+        "surface_pressure",
+        "wind_speed_10m",
+        "wind_direction_10m",
+        "wind_gusts_10m",
+        "precipitation",
+        "shortwave_radiation",
+        "direct_normal_irradiance",
+        "soil_temperature_0cm",
+        "soil_moisture_0_to_1cm",
+        "evapotranspiration"
+    ])
 
     url = (
         "https://archive-api.open-meteo.com/v1/archive"
         f"?latitude={lat}&longitude={lon}"
         f"&start_date={ref_date}&end_date={ref_date}"
-        f"&hourly={hourly_vars}"
-        "&timezone=America%2FSao_Paulo"
+        f"&hourly={vars_str}"
+        "&timezone=UTC"
     )
 
-    headers = {"User-Agent": "AmazonSafe-DataCollector/1.0"}
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        h = data.get("hourly", {}) or {}
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            r.raise_for_status()
-            data = r.json()
-            h = data.get("hourly", {}) or {}
+        clima = {}
+        for var in h:
+            serie = h[var]
+            serie_ok = [
+                x for x in serie
+                if x is not None and isinstance(x, (int, float)) and not pd.isna(x)
+            ]
+            clima[var] = float(sum(serie_ok) / len(serie_ok)) if serie_ok else None
 
-            clima = {}
-            for var in variables:
-                serie = h.get(var, [])
-                serie_ok = [
-                    x for x in serie
-                    if x is not None and not pd.isna(x) and isinstance(x, (int, float))
-                ]
-                clima[var] = float(sum(serie_ok) / len(serie_ok)) if serie_ok else None
+        return clima
 
-            return clima
+    except Exception as e:
+        print(f"[IA Archive] ERRO: {e}")
+        return None
 
-        except Exception as e:
-            print(f"[IA][Archive] ERRO {attempt}/{max_retries}: {e}")
-            time.sleep(2)
+# ============================================================
+# 8.5 — FOCOS POR RAIO (COMPARAÇÃO REAL x PREVISTO)
+# ============================================================
 
-    print("[IA][Archive] Falhou todas as tentativas")
-    return None
-
-# ------------------------------
-# 8.3 — FOCOS POR RAIO (50 / 150 / 300 km)
-# ------------------------------
-def focos_por_raios_backend(lat: float, lon: float) -> dict:
+def focos_por_raios_backend(lat: float, lon: float):
     """
-    Conta focos reais da API /inpe_focos_near em 50/150/300 km.
-    Não entra no modelo, mas serve para comparação real x previsto.
+    Conta focos reais em 50 / 150 / 300 km.
+    Não entra no modelo — apenas comparação.
     """
     try:
-        data = inpe_focos_near(
-            lat=lat,
-            lon=lon,
-            raio_km=300,
-            scope="diario",
-            region="Brasil",
-            limit=5000,
-            timeout=HTTP_TIMEOUT,
-        )
-        focos = (data.get("features") or {}).get("focos") or []
-    except Exception as e:
-        print(f"[IA][INPE] ERRO: {e}")
+        data = inpe_focos_near(lat, lon, raio_km=300)
+        focos = data["features"]["focos"]
+    except:
         focos = []
 
     f50 = f150 = f300 = 0
@@ -1256,6 +1160,7 @@ def focos_por_raios_backend(lat: float, lon: float) -> dict:
             d = float(d)
         except:
             continue
+
         if d <= 50: f50 += 1
         if d <= 150: f150 += 1
         if d <= 300: f300 += 1
@@ -1266,88 +1171,66 @@ def focos_por_raios_backend(lat: float, lon: float) -> dict:
         "focos_300km": f300,
     }
 
-# ------------------------------
-# 8.4 — MONTAGEM DO VETOR DE FEATURES
-# ------------------------------
-def build_model_features(lat: float, lon: float, ref_date: str):
-    clima = collect_weather_archive(lat, lon, ref_date)
-    if clima is None:
-        raise HTTPException(
-            status_code=502,
-            detail="Falha ao obter clima diário do Open-Meteo Archive"
-        )
+# ============================================================
+# 8.6 — ENDPOINT /api/model_score (USO COM REF_DATE)
+# ============================================================
 
-    focos_raios = focos_por_raios_backend(lat, lon)
-
-    row = []
-    for col in MODEL_FEATURES:
-        v = clima.get(col)
-        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-            row.append(0.0)
-        else:
-            row.append(float(v))
-
-    X = np.array([row], dtype=float)
-    return clima, focos_raios, X
-
-# ------------------------------
-# 8.5 — ENDPOINT /api/model_score
-# ------------------------------
 class AIScoreRequest(BaseModel):
     cidade: str | None = None
     lat: float | None = None
     lon: float | None = None
     ref_date: str | None = None
 
-@app.post("/api/model_score", tags=["IA"], summary="Score IA AmazonSafe (RandomForest)")
+@app.post("/api/model_score", tags=["IA"], summary="Predição histórica (Archive)")
 def api_model_score(body: AIScoreRequest):
 
-    # Resolve localização
+    # resolve local
     if body.cidade:
-        lat, lon, loc_meta = _resolve_location(body.cidade, None, None)
-    elif body.lat is not None and body.lon is not None:
-        lat = float(body.lat)
-        lon = float(body.lon)
-        loc_meta = {"resolved_by": "direct_params"}
+        lat, lon, meta = _resolve_location(body.cidade, None, None)
+    elif body.lat and body.lon:
+        lat, lon = body.lat, body.lon
+        meta = {"resolved_by": "direct_params"}
     else:
-        lat = float(DEFAULT_LAT)
-        lon = float(DEFAULT_LON)
-        loc_meta = {"resolved_by": "default"}
+        lat, lon = DEFAULT_LAT, DEFAULT_LON
+        meta = {"resolved_by": "default"}
 
     ref_date = body.ref_date or dt.date.today().strftime("%Y-%m-%d")
 
-    clima, focos_raios, X = build_model_features(lat, lon, ref_date)
+    clima = collect_weather_archive(lat, lon, ref_date)
+    if clima is None:
+        raise HTTPException(status_code=502, detail="Falha ao obter clima via Archive")
 
-    try:
-        predicted = float(modelo_pipeline.predict(X)[0])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao executar IA: {e}")
+    # montar X usando as features atuais
+    row = []
+    for col in MODEL_FEATURES:
+        v = clima.get(col)
+        row.append(0.0 if v is None or not isinstance(v, (int, float)) else float(v))
 
-    # Classificação simples
-    if predicted < 20:
+    X = np.array([row], dtype=float)
+
+    predicted = float(modelo_pipeline.predict(X)[0])
+
+    if predicted < 50:
         risco = "baixo"
-    elif predicted < 80:
-        risco = "médio"
+    elif predicted < 150:
+        risco = "medio"
     else:
         risco = "alto"
 
+    focos_real = focos_por_raios_backend(lat, lon)
+
     return {
         "ok": True,
-        "modelo": {"path": MODEL_PATH, "features": MODEL_FEATURES},
-        "local": {
-            "cidade": body.cidade,
-            "lat": lat,
-            "lon": lon,
-            "resolve": loc_meta,
-            "ref_date": ref_date,
-        },
+        "local": meta,
+        "ref_date": ref_date,
         "clima_archive": clima,
-        "focos_raios_reais": focos_raios,
+        "focos_reais": focos_real,
         "predicao": {
             "focos_previstos_300km": predicted,
-            "risco_classificado": risco,
-        },
+            "risco": risco,
+        }
     }
+
 
 # ============================================================
 # 🧩 MÓDULO 9 — IA LEVE + Scoring Inteligente (MAD + Score Avançado)
@@ -1433,8 +1316,8 @@ def _hours_since(iso_str: Optional[str]) -> Optional[float]:
 def _rainfall_risk_u(mm: Optional[float]) -> float:
     """
     Converte precipitação (mm/24h) para risco 0..1.
-    0 mm = 0.0 (nenhum risco)
-    >= 50 mm = 1.0 (risco extremo)
+    0 mm  = 0.0 (nenhum risco)
+    50 mm = 1.0 (risco extremo)
     """
     if mm is None:
         return 0.0
@@ -1451,7 +1334,7 @@ def _rainfall_risk_u(mm: Optional[float]) -> float:
 
 
 def _rainfall_index(mm: Optional[float]) -> float:
-    """Alias semântica — mantém apenas consistência de nome."""
+    """Alias semântica — mantém consistência de nome."""
     return _rainfall_risk_u(mm)
 
 
@@ -1466,7 +1349,7 @@ def compute_alert_score(alert_obs: Dict[str, Any],
     - duration (0..1)
     - frequency (0..1)
     - impact (0..1)
-    - rainfall (precipitação 24h -> 0..1)
+    - rainfall (chuva_mm/precipitação 24h -> 0..1)
 
     Retorna ScoreResult com score, nível e detalhamento.
     """
@@ -1476,9 +1359,10 @@ def compute_alert_score(alert_obs: Dict[str, Any],
     freq = _clip01(alert_obs.get("frequency", 0))
     imp = _clip01(alert_obs.get("impact", 0))
 
-    # Busca precipitação: tenta várias chaves possíveis no payload
+    # Busca precipitação: suporta chaves novas (chuva_mm) e legadas
     precip_24h = (
         alert_obs.get("precip_24h")
+        or alert_obs.get("chuva_mm")
         or alert_obs.get("precipitation")
         or (alert_obs.get("meta", {}).get("precipitation"))
         or 0.0
@@ -1511,7 +1395,7 @@ def compute_alert_score(alert_obs: Dict[str, Any],
 
 
 # ============================================================
-# IA Leve: Detectores de Outliers (MAD)
+# IA Leve: Detectores de Outliers (MAD) usando WeatherObs
 # ============================================================
 
 def _round_coord(v: float, ndigits: int = 3) -> float:
@@ -1539,8 +1423,13 @@ def pm_outlier_flags(
 ) -> Tuple[bool, bool]:
     """
     Detecta se pm25/pm10 são outliers usando MAD:
-    - Busca últimas N medições próximas nas tabelas AirObs
+
+    - Busca últimas N medições próximas na tabela WeatherObs
+      (histórico local de qualidade do ar)
     - Compara com mediana ± k * MAD * 1.4826
+
+    Retorna:
+        (flag_pm25_outlier, flag_pm10_outlier)
     """
 
     if pm25 is None and pm10 is None:
@@ -1549,13 +1438,16 @@ def pm_outlier_flags(
     latk = _round_coord(lat)
     lonk = _round_coord(lon)
 
-    # Carrega histórico local
+    from .main import WeatherObs  # se estiver em arquivo separado, ajuste o import
+    # No seu caso, como está tudo no mesmo main.py, você pode remover essa linha
+    # e garantir que WeatherObs já foi definido acima no arquivo.
+
     with Session(engine) as s:
         rows = s.exec(
-            select(AirObs)
-            .where(AirObs.lat.between(latk - 0.001, latk + 0.001))
-            .where(AirObs.lon.between(lonk - 0.001, lonk + 0.001))
-            .order_by(AirObs.observed_at.desc())
+            select(WeatherObs)
+            .where(WeatherObs.lat.between(latk - 0.001, latk + 0.001))
+            .where(WeatherObs.lon.between(lonk - 0.001, lonk + 0.001))
+            .order_by(WeatherObs.observed_at.desc())
             .limit(lookback)
         ).all()
 
@@ -1577,224 +1469,92 @@ def pm_outlier_flags(
 
     return p25_flag, p10_flag
 
+
 # ============================================================
-# 🧩 MÓDULO 10 — COLETORES LEGACY (Dashboard)
+# 🧩 MÓDULO 10 — COLETORES ATUAIS PARA O DASHBOARD (v10)
 # ============================================================
 
-def _collect_weather(lat: float, lon: float, provider: str = "open-meteo") -> dict:
+def collect_weather_now(lat: float, lon: float) -> dict:
     """
-    Clima atual para o dashboard.
-    NÃO é usado no modelo IA (que utiliza collect_weather_archive).
+    Coleta o clima atual usando o novo get_meteo() oficial.
+    Retorna todas as variáveis do dataset v10 em um formato padronizado.
     """
-    if provider == "owm":
-        raw = get_openweather(lat, lon, timeout=HTTP_TIMEOUT)
-        feats = normalize_openweather(raw)
-        fonte = "openweathermap"
 
-    else:
-        raw = get_open_meteo(lat, lon, timeout=HTTP_TIMEOUT)
-        feats = normalize_open_meteo(raw)
+    try:
+        clima = get_meteo(lat, lon)
+    except Exception as e:
+        return {
+            "ok": False,
+            "erro": str(e),
+            "fonte": "open-meteo",
+            "features": {}
+        }
 
-        # garantir unidades e timestamp
-        units = (raw or {}).get("current_units") or {}
-        observed_at = ((raw or {}).get("current") or {}).get("time")
-
-        feats.setdefault("meta", {}).setdefault("units", units)
-        if "observed_at" not in feats and observed_at:
-            feats["observed_at"] = observed_at
-
-        fonte = "open-meteo"
-
-    # saneamento defensivo
-    for k in ("temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"):
-        v = feats.get(k)
-        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-            feats[k] = None
+    # Normaliza os dados em floats (já vem do normalize_meteo)
+    clima_norm = normalize_meteo(clima)
 
     return {
-        "fonte": fonte,
-        "features": feats,
-        "payload": raw
+        "ok": True,
+        "fonte": "open-meteo",
+        "latitude": lat,
+        "longitude": lon,
+        "features": clima_norm,
     }
 
 
-def _collect_air(lat: float, lon: float, radius_m: int = 10000) -> dict:
+def collect_focos_now(lat: float, lon: float) -> dict:
     """
-    Coleta qualidade do ar via OpenAQ v3 com múltiplos fallbacks:
-      - /locations + /latest
-      - /measurements por location_id
-      - /measurements por sensor_id
-
-    Retorna um formato padronizado para o dashboard.
+    Retorna focos reais próximos em 50, 150 e 300 km.
     """
-    # 1) Buscar estações próximas
-    locs = openaq_locations(lat, lon, radius_m=radius_m, limit=1, timeout=HTTP_TIMEOUT)
-    results = locs.get("results", []) or []
 
-    # fallback: ampliar raio para 25 km
-    if not results and (locs.get("_used_radius", 0) < 25000):
-        locs = openaq_locations(lat, lon, radius_m=25000, limit=1, timeout=HTTP_TIMEOUT)
-        results = locs.get("results", []) or []
-
-    a_norm = {}
-    loc_id = None
-    latest = {}
-    sensors = {}
-    fallback_meas = {}
-
-    if results:
-        loc_id = results[0].get("id")
-
-        # 2) /latest e /sensors
-        latest = openaq_latest_by_location_id(loc_id, timeout=HTTP_TIMEOUT)
-        sensors = openaq_sensors_by_location_id(loc_id, timeout=HTTP_TIMEOUT)
-        a_norm = normalize_openaq_v3_latest(latest, sensors)
-
-        need_sensor_fallback = (
-            a_norm.get("pm25") is None and a_norm.get("pm10") is None
-        )
-
-        # 2.a) fallback via /measurements (location_id)
-        if need_sensor_fallback:
-            try:
-                fallback_meas = openaq_measurements_by_location_id(
-                    loc_id, limit=120, recency_days=3, timeout=HTTP_TIMEOUT
-                )
-                vals = {"pm25": [], "pm10": []}
-                units = {}
-                last_local, last_utc = None, None
-
-                for m in (fallback_meas or {}).get("results", []) or []:
-                    param = _param_name_to_str(m.get("parameter"))
-                    val = m.get("value")
-                    unit = m.get("unit")
-                    date = m.get("date") or {}
-
-                    if isinstance(val, (int, float)):
-                        if param in {"pm25", "pm2.5"}:
-                            vals["pm25"].append(float(val))
-                            units["pm25"] = _canonical_unit(unit, "pm25") or units.get("pm25")
-                        elif param == "pm10":
-                            vals["pm10"].append(float(val))
-                            units["pm10"] = _canonical_unit(unit, "pm10") or units.get("pm10")
-
-                    if date.get("local"):
-                        last_local = max(last_local, date["local"]) if last_local else date["local"]
-                    if date.get("utc"):
-                        last_utc = max(last_utc, date["utc"]) if last_utc else date["utc"]
-
-                if vals["pm25"] or vals["pm10"]:
-                    a_norm = {
-                        "pm25": (sum(vals["pm25"]) / len(vals["pm25"])) if vals["pm25"] else None,
-                        "pm10": (sum(vals["pm10"]) / len(vals["pm10"])) if vals["pm10"] else None,
-                        "meta": {
-                            "units": units,
-                            "last_local": last_local,
-                            "last_utc": last_utc,
-                        }
-                    }
-                    need_sensor_fallback = False
-
-            except requests.HTTPError as e:
-                if getattr(e.response, "status_code", None) != 404:
-                    raise
-
-        # 2.b) fallback via sensores individuais
-        if need_sensor_fallback:
-            vals = {"pm25": [], "pm10": []}
-            units = {}
-            last_local, last_utc = None, None
-
-            for s in (sensors or {}).get("results", []) or []:
-                pname = _param_name_to_str(s.get("parameter"))
-                if pname not in {"pm25", "pm2.5", "pm10"}:
-                    continue
-
-                sid = s.get("id")
-                if not isinstance(sid, int):
-                    continue
-
-                try:
-                    sm = openaq_measurements_by_sensor_id(
-                        sid, limit=80, recency_days=3, timeout=HTTP_TIMEOUT
-                    )
-                except Exception:
-                    continue
-
-                for m in (sm or {}).get("results", []) or []:
-                    val = m.get("value")
-                    unit = m.get("unit")
-                    date = m.get("date") or {}
-
-                    if isinstance(val, (int, float)):
-                        if pname in {"pm25", "pm2.5"}:
-                            vals["pm25"].append(float(val))
-                            units["pm25"] = _canonical_unit(unit, "pm25") or units.get("pm25")
-                        elif pname == "pm10":
-                            vals["pm10"].append(float(val))
-                            units["pm10"] = _canonical_unit(unit, "pm10") or units.get("pm10")
-
-                    if date.get("local"):
-                        last_local = max(last_local, date["local"]) if last_local else date["local"]
-                    if date.get("utc"):
-                        last_utc = max(last_utc, date["utc"]) if last_utc else date["utc"]
-
-            if vals["pm25"] or vals["pm10"]:
-                a_norm = {
-                    "pm25": (sum(vals["pm25"]) / len(vals["pm25"])) if vals["pm25"] else None,
-                    "pm10": (sum(vals["pm10"]) / len(vals["pm10"])) if vals["pm10"] else None,
-                    "meta": {
-                        "units": units,
-                        "last_local": last_local,
-                        "last_utc": last_utc,
-                    }
-                }
-
-    # marcar fonte para debug
-    if a_norm:
-        if fallback_meas:
-            src = "measurements_fallback"
-        elif a_norm.get("meta") and not a_norm["meta"].get("last_local"):
-            src = "sensor_fallback"
-        else:
-            src = "latest"
-        a_norm.setdefault("meta", {})["source"] = src
+    try:
+        focos = focos_por_raios_backend(lat, lon)
+    except Exception as e:
+        return {
+            "ok": False,
+            "erro": str(e),
+        }
 
     return {
-        "fonte": "openaq",
-        "location_id": loc_id,
-        "features": a_norm or {
-            "pm25": None,
-            "pm10": None,
-            "meta": {"units": {}, "source": "none"}
-        },
-        "locations": locs,
+        "ok": True,
+        "latitude": lat,
+        "longitude": lon,
+        "focos": focos
+    }
+
+
+def collect_dashboard_bundle(lat: float, lon: float) -> dict:
+    """
+    Pacote simplificado para o front-end (dashboard).
+    Retorna clima atual + focos reais num único payload.
+    """
+
+    clima = collect_weather_now(lat, lon)
+    focos = collect_focos_now(lat, lon)
+
+    return {
+        "ok": True,
+        "coords": {"lat": lat, "lon": lon},
+        "clima": clima,
+        "focos": focos,
     }
 
 # ============================================================
-# 🧩 MÓDULO 11 — ENDPOINT LEGADO /api/data (Dashboard)
+# 🧩 MÓDULO 11 — ENDPOINT /api/data (Dashboard v10)
 # ============================================================
 
 class DataRequest(BaseModel):
     cidade: str | None = None
     lat: float | None = None
     lon: float | None = None
-    raio_km: int = 150
-    air_radius_m: int = 10000
-    weather_provider: str = "open-meteo"
 
 
-@app.post("/api/data", tags=["Dashboard"], summary="Dados completos para o dashboard")
+@app.post("/api/data", tags=["Dashboard"], summary="Dados completos para o dashboard AmazonSafe v10")
 def api_data(req: DataRequest):
-    """
-    Retorna:
-      - Clima atual (Open-Meteo ou OWM)
-      - Qualidade do ar via OpenAQ v3
-      - Focos do INPE no raio desejado
-      - Metadados da localização
-    """
 
+    # ------------------------------------------------------------
     # 1) Resolver localização
+    # ------------------------------------------------------------
     try:
         lat, lon, loc_meta = _resolve_location(
             cidade=req.cidade,
@@ -1809,57 +1569,148 @@ def api_data(req: DataRequest):
             detail=f"Erro ao resolver localização: {e}"
         )
 
-    # 2) Clima atual (coletores legados)
+    # ------------------------------------------------------------
+    # 2) Clima atual (usando o novo get_meteo)
+    # ------------------------------------------------------------
     try:
-        clima_now = _collect_weather(lat, lon, provider=req.weather_provider)
+        clima_raw = get_meteo(lat, lon)
+        clima = normalize_meteo(clima_raw)
     except Exception as e:
-        clima_now = {"erro": str(e)}
+        clima = {}
+        clima_raw = {"erro": str(e)}
 
-    # 3) Qualidade do ar
+    # ------------------------------------------------------------
+    # 3) Focos reais via backend (50 / 150 / 300 km)
+    # ------------------------------------------------------------
     try:
-        air_now = _collect_air(lat, lon, radius_m=req.air_radius_m)
+        focos = focos_por_raios_backend(lat, lon)
     except Exception as e:
-        air_now = {"erro": str(e)}
+        focos = {"erro": str(e)}
 
-    # 4) Focos do INPE no raio solicitado
+    # ------------------------------------------------------------
+    # 4) Retorno consolidado no novo padrão v10
+    # ------------------------------------------------------------
+    return {
+        "ok": True,
+        "local": {
+            "entrada_cidade": req.cidade,
+            "lat": lat,
+            "lon": lon,
+            "resolved_by": loc_meta.get("resolved_by"),
+            "display_name": loc_meta.get("display_name"),
+        },
+        "clima_atual": {
+            "fonte": "open-meteo",
+            "features": clima,
+            "raw": clima_raw
+        },
+        "focos_reais": focos,
+    }
+# ============================================================
+# 🧩 MÓDULO 12 — ENDPOINT /api/data_auto (Dashboard + IA v10)
+# ============================================================
+
+class DataAutoRequest(BaseModel):
+    cidade: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+
+
+@app.post("/api/data_auto", tags=["Dashboard"], summary="Dados completos + IA (AmazonSafe v10)")
+def api_data_auto(req: DataAutoRequest):
+
+    # ------------------------------------------------------------
+    # 1) Resolver localização
+    # ------------------------------------------------------------
     try:
-        focos_raw = inpe_focos_near(
-            lat=lat,
-            lon=lon,
-            raio_km=req.raio_km,
-            scope="diario",
-            region="Brasil",
-            limit=3000,
-            timeout=HTTP_TIMEOUT,
+        lat, lon, loc_meta = _resolve_location(
+            cidade=req.cidade,
+            lat=req.lat,
+            lon=req.lon
         )
-        focos_lista = (focos_raw.get("features") or {}).get("focos") or []
-
-        focos_limpos = []
-        for f in focos_lista:
-            dist = f.get("dist_km")
-            try:
-                dist = float(dist)
-            except Exception:
-                dist = None
-
-            focos_limpos.append({
-                "lat": f.get("lat"),
-                "lon": f.get("lon"),
-                "dist_km": dist,
-                "bioma": f.get("bioma"),
-                "pais": f.get("pais"),
-                "uf": f.get("uf"),
-                "municipio": f.get("municipio"),
-                "frp": f.get("frp"),
-                "data_hora_gmt": f.get("data_hora_gmt"),
-                "satelite": f.get("satelite"),
-            })
-
+    except HTTPException:
+        raise
     except Exception as e:
-        focos_limpos = []
-        focos_raw = {"erro": str(e)}
+        raise HTTPException(
+            status_code=400,
+            detail=f"Erro ao resolver localização: {e}"
+        )
 
-    # 5) Retorno consolidado
+    # ------------------------------------------------------------
+    # 2) Clima atual (Open-Meteo Forecast)
+    # ------------------------------------------------------------
+    try:
+        clima_raw = get_meteo(lat, lon)
+        clima = normalize_meteo(clima_raw)
+    except Exception as e:
+        clima_raw = {"erro": str(e)}
+        clima = {}
+
+    # ------------------------------------------------------------
+    # 3) Focos reais (50 / 150 / 300 km)
+    # ------------------------------------------------------------
+    try:
+        focos_reais = focos_por_raios_backend(lat, lon)
+    except Exception as e:
+        focos_reais = {"erro": str(e)}
+
+    # ------------------------------------------------------------
+    # 4) IA — Preparar vetor para o modelo
+    # ------------------------------------------------------------
+    if modelo_pipeline is None:
+        raise HTTPException(status_code=500, detail="Modelo IA não carregado")
+
+    try:
+        row = [
+            clima.get("temperature_2m"),
+            clima.get("relativehumidity_2m"),
+            clima.get("dewpoint_2m"),
+            clima.get("surface_pressure"),
+            clima.get("windspeed_10m"),
+            clima.get("winddirection_10m"),
+            clima.get("windgusts_10m"),
+            clima.get("precipitation"),
+            clima.get("shortwave_radiation"),
+            clima.get("direct_normal_irradiance"),
+            clima.get("evapotranspiration"),
+            clima.get("soil_temperature_0cm"),
+            clima.get("soil_moisture_0_to_1cm"),
+            focos_reais.get("focos_50km"),
+            focos_reais.get("focos_150km"),
+            focos_reais.get("focos_300km"),
+        ]
+
+        X = np.array([row], dtype=float)
+
+        focos_prev = float(modelo_pipeline.predict(X)[0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao executar IA: {e}")
+
+    # ------------------------------------------------------------
+    # 5) Riscos: simples e híbrido
+    # ------------------------------------------------------------
+    # Risco simples (baseado apenas nos tercis)
+    if focos_prev <= 50:
+        risco_simples = "baixo"
+    elif focos_prev <= 150:
+        risco_simples = "medio"
+    else:
+        risco_simples = "alto"
+
+    # Score híbrido
+    temp = clima.get("temperature_2m") or 0
+    score_h = (temp / 40) + (focos_prev / 300)
+
+    if score_h <= 1:
+        risco_h = "baixo"
+    elif score_h <= 2:
+        risco_h = "medio"
+    else:
+        risco_h = "alto"
+
+    # ------------------------------------------------------------
+    # 6) Retorno consolidado para o front
+    # ------------------------------------------------------------
     return {
         "ok": True,
         "local": {
@@ -1869,17 +1720,22 @@ def api_data(req: DataRequest):
             "resolved_by": loc_meta.get("resolved_by"),
             "display_name": loc_meta.get("display_name"),
         },
-        "clima": clima_now,
-        "air_quality": air_now,
-        "focos": {
-            "total": len(focos_limpos),
-            "items": focos_limpos,
-            "payload_raw": focos_raw,
+        "clima_atual": {
+            "features": clima,
+            "raw": clima_raw,
         },
+        "focos_reais": focos_reais,
+        "ia": {
+            "modelo": MODEL_PATH,
+            "focos_previstos_300km": focos_prev,
+            "risco_simples": risco_simples,
+            "score_hibrido": round(score_h, 3),
+            "risco_hibrido": risco_h,
+        }
     }
 
 # ============================================================
-# 🧩 MÓDULO 12 — Atualização de Alertas + Score Inteligente
+# 🧩 MÓDULO 13 — Atualização de Alertas + Score Inteligente
 # ============================================================
 
 class AlertUpdateRequest(BaseModel):
@@ -1930,7 +1786,7 @@ def api_alertas_update(req: AlertUpdateRequest):
     # 2) Clima atual
     # --------------------------------------------------------
     try:
-        clima_now = _collect_weather(lat, lon, provider=req.weather_provider)
+        clima_now = collect_weather_now(...)
         clima_feat = clima_now.get("features") or {}
     except Exception as e:
         clima_now = {"erro": str(e)}
@@ -1940,7 +1796,7 @@ def api_alertas_update(req: AlertUpdateRequest):
     # 3) Qualidade do ar
     # --------------------------------------------------------
     try:
-        air_now = _collect_air(lat, lon, radius_m=req.air_radius_m)
+        air_now   = {"fonte": "none", "features": {"pm25": None, "pm10": None}}
         air_feat = air_now.get("features") or {}
     except Exception as e:
         air_now = {"erro": str(e)}
@@ -2070,7 +1926,7 @@ def api_alertas_update(req: AlertUpdateRequest):
     }
 
 # ============================================================
-# 🧩 MÓDULO 13 — Rotas Administrativas / Diagnóstico
+# 🧩 MÓDULO 14 — Rotas Administrativas / Diagnóstico (v2)
 # ============================================================
 
 from fastapi import APIRouter
@@ -2079,7 +1935,7 @@ from sqlmodel import Session, select
 router_admin = APIRouter(prefix="/admin", tags=["Admin"])
 
 # ------------------------------------------------------------
-# 13.1 — Status geral do backend
+# 14.1 — Status geral
 # ------------------------------------------------------------
 @router_admin.get("/status", summary="Status geral do backend")
 def admin_status():
@@ -2095,7 +1951,7 @@ def admin_status():
     }
 
 # ------------------------------------------------------------
-# 13.2 — Verificar estado do modelo IA
+# 14.2 — Diagnóstico do modelo IA
 # ------------------------------------------------------------
 @router_admin.get("/model_state", summary="Diagnóstico do modelo IA")
 def admin_model_state():
@@ -2111,13 +1967,12 @@ def admin_model_state():
     }
 
 # ------------------------------------------------------------
-# 13.3 — Últimos registros do banco (weather / air / fire)
+# 14.3 — Últimos registros persistidos
 # ------------------------------------------------------------
 @router_admin.get("/last_records", summary="Últimas observações persistidas")
 def admin_last_records():
     try:
         w = get_last_weather()
-        a = get_last_air()
         f = get_last_fire()
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -2125,44 +1980,47 @@ def admin_last_records():
     return {
         "ok": True,
         "last_weather": w.dict() if w else None,
-        "last_air": a.dict() if a else None,
         "last_fire": f.dict() if f else None,
     }
 
 # ------------------------------------------------------------
-# 13.4 — Teste de conexão com provedores externos
+# 14.4 — Teste de conexão com serviços externos (NOVO)
 # ------------------------------------------------------------
-@router_admin.get("/external_check", summary="Verifica serviços externos (Open-Meteo / INPE / OpenAQ)")
+@router_admin.get("/external_check", summary="Verifica serviços externos (Open-Meteo / INPE)")
 def admin_external_check():
     status = {}
 
-    # Open-Meteo
+    # Teste Open-Meteo (forecast)
     try:
-        test = get_open_meteo(DEFAULT_LAT, DEFAULT_LON, timeout=10)
-        status["open_meteo"] = "ok" if test else "fail"
+        clima = get_meteo(DEFAULT_LAT, DEFAULT_LON)
+        status["open_meteo"] = "ok" if clima else "fail"
     except Exception as e:
         status["open_meteo"] = f"error: {e}"
 
-    # INPE focos (raio pequeno para ser rápido)
+    # Teste INPE focos
     try:
-        d = inpe_focos_near(DEFAULT_LAT, DEFAULT_LON, 50, INPE_DEFAULT_SCOPE, INPE_DEFAULT_REGION, 20, timeout=10)
+        d = inpe_focos_near(
+            DEFAULT_LAT,
+            DEFAULT_LON,
+            50,
+            INPE_DEFAULT_SCOPE,
+            INPE_DEFAULT_REGION,
+            10,
+            timeout=10
+        )
         status["inpe"] = "ok" if d else "fail"
     except Exception as e:
         status["inpe"] = f"error: {e}"
 
-    # OpenAQ
-    try:
-        locs = openaq_locations(DEFAULT_LAT, DEFAULT_LON, radius_m=10000, limit=1, timeout=10)
-        status["openaq"] = "ok" if locs else "fail"
-    except Exception as e:
-        status["openaq"] = f"error: {e}"
+    # OpenAQ REMOVIDO
+    status["openaq"] = "not_available"
 
     return status
 
 # ------------------------------------------------------------
-# 13.5 — Teste do Geocoder
+# 14.5 — Teste Geocoder
 # ------------------------------------------------------------
-@router_admin.get("/geocode_test", summary="Testa geocodificação de uma cidade")
+@router_admin.get("/geocode_test", summary="Testa geocodificação")
 def admin_geocode_test(cidade: str):
     info = geocode_city(cidade)
     if not info:
@@ -2170,7 +2028,7 @@ def admin_geocode_test(cidade: str):
     return {"ok": True, "result": info}
 
 # ------------------------------------------------------------
-# 13.6 — Limpar caches (somente ambiente local!)
+# 14.6 — Limpeza de cache
 # ------------------------------------------------------------
 @router_admin.post("/clear_cache", summary="Limpa caches internos (somente local)")
 def admin_clear_cache():
@@ -2183,12 +2041,13 @@ def admin_clear_cache():
     return {"ok": True, "cache_size": len(_CACHE)}
 
 # ------------------------------------------------------------
-# Registrar o router administrativo na API principal
+# Registrar router
 # ------------------------------------------------------------
 app.include_router(router_admin)
 
+
 # ============================================================
-# 🧩 MÓDULO 14 — Logging, Auditoria e Telemetria Interna
+# 🧩 MÓDULO 15 — Logging, Auditoria e Telemetria Interna
 # ============================================================
 
 import json
@@ -2202,17 +2061,17 @@ from fastapi import APIRouter
 router_logs = APIRouter(prefix="/logs", tags=["Logs"])
 
 # ------------------------------------------------------------
-# 14.1 — Garantir diretório de logs
+# 15.1 — Garantir diretório de logs
 # ------------------------------------------------------------
 def _ensure_logs_dir():
-    d = os.path.join(os.path.dirname(__file__), "runtime_data")
+    d = "./runtime_data"
     os.makedirs(d, exist_ok=True)
     return d
 
 LOG_PATH = os.path.join(_ensure_logs_dir(), "events.ndjson")
 
 # ------------------------------------------------------------
-# 14.2 — Função central de registro de log
+# 15.2 — Função central de registro de log
 # ------------------------------------------------------------
 def log_event(event_type: str, message: str, extra: Dict[str, Any] | None = None):
     """
@@ -2236,7 +2095,7 @@ def log_event(event_type: str, message: str, extra: Dict[str, Any] | None = None
 
 
 # ------------------------------------------------------------
-# 14.3 — Middleware opcional para registrar chamadas de API
+# 15.3 — Middleware opcional para registrar chamadas de API
 # ------------------------------------------------------------
 @app.middleware("http")
 async def audit_api_calls(request: Request, call_next):
@@ -2269,7 +2128,7 @@ async def audit_api_calls(request: Request, call_next):
 
 
 # ------------------------------------------------------------
-# 14.4 — Funções utilitárias para logs críticos
+# 15.4 — Funções utilitárias para logs críticos
 # ------------------------------------------------------------
 def log_error(message: str, extra: Dict[str, Any] | None = None):
     log_event("error", message, extra)
@@ -2293,7 +2152,7 @@ def log_model_inference(lat: float, lon: float, result: Any, ref_date: str):
 
 
 # ------------------------------------------------------------
-# 14.5 — Endpoint administrativo: últimos N logs
+# 15.5 — Endpoint administrativo: últimos N logs
 # ------------------------------------------------------------
 @router_logs.get("/tail", summary="Lê os últimos eventos de log")
 def tail_logs(n: int = 50):
@@ -2319,7 +2178,7 @@ def tail_logs(n: int = 50):
 
 
 # ------------------------------------------------------------
-# 14.6 — Endpoint para registrar um log manual (debug/teste)
+# 15.6 — Endpoint para registrar um log manual (debug/teste)
 # ------------------------------------------------------------
 @router_logs.post("/push", summary="Registro manual de log (debug)")
 def push_log(event_type: str, message: str):
@@ -2328,24 +2187,32 @@ def push_log(event_type: str, message: str):
 
 
 # ------------------------------------------------------------
-# 14.7 — Registrar router na API principal
+# 15.7 — Registrar router na API principal
 # ------------------------------------------------------------
 app.include_router(router_logs)
 
 # ============================================================
-# 🧩 MÓDULO 15 — Healthcheck, Métricas e Autoverificação
+# 🧩 MÓDULO 16 — Healthcheck, Métricas e Autoverificação (v2)
 # ============================================================
 
 from fastapi import APIRouter
+from fastapi.responses import PlainTextResponse
 import os
 import time
 import json
+import numpy as np
 
 router_health = APIRouter(prefix="/system", tags=["Sistema"])
 
+# ------------------------------------------------------------
+# 16.0 — Helper UTC
+# ------------------------------------------------------------
+def now_utc():
+    return _now_utc()   # usa o helper oficial do módulo 6
+
 
 # ------------------------------------------------------------
-# 15.1 — Endpoint /health (simples e rápido)
+# 16.1 — /health básico
 # ------------------------------------------------------------
 @router_health.get("/health", summary="Healthcheck básico")
 def api_health():
@@ -2358,7 +2225,7 @@ def api_health():
 
 
 # ------------------------------------------------------------
-# 15.2 — Testar rapidamente o modelo IA
+# 16.2 — Teste rápido do modelo IA
 # ------------------------------------------------------------
 @router_health.get("/health/model", summary="Testa o modelo carregado")
 def api_health_model():
@@ -2366,8 +2233,8 @@ def api_health_model():
         return {"ok": False, "error": "Modelo IA não carregado"}
 
     try:
-        # vetor mínimo em zeros só pra testar o pipeline
-        test_x = np.zeros((1, len(get_model_feature_names() or MODEL_FEATURES)))
+        n = len(getattr(modelo_pipeline, "feature_names_in_", MODEL_FEATURES))
+        test_x = np.zeros((1, n))
         pred = modelo_pipeline.predict(test_x)[0]
         return {"ok": True, "prediction_test": float(pred)}
     except Exception as e:
@@ -2375,31 +2242,37 @@ def api_health_model():
 
 
 # ------------------------------------------------------------
-# 15.3 — Testar APIs externas (Open-Meteo, OpenAQ, INPE)
+# 16.3 — Teste de provedores externos
 # ------------------------------------------------------------
-@router_health.get("/health/providers", summary="Testa provedores externos (clima/ar/focos)")
+@router_health.get("/health/providers", summary="Testa Open-Meteo / INPE")
 def api_health_providers():
 
     results = {}
 
-    # 1) Open-Meteo Forecast
+    # Open-Meteo Forecast
     try:
-        raw = get_open_meteo(DEFAULT_LAT, DEFAULT_LON, timeout=5)
-        results["open_meteo"] = {"ok": True, "temp": raw.get("current", {}).get("temperature_2m")}
+        clima = get_meteo(DEFAULT_LAT, DEFAULT_LON)
+        results["open_meteo"] = {
+            "ok": True,
+            "temp": clima.get("temperature_2m")
+        }
     except Exception as e:
         results["open_meteo"] = {"ok": False, "error": str(e)}
 
-    # 2) OpenAQ
-    try:
-        loc = openaq_locations(DEFAULT_LAT, DEFAULT_LON, radius_m=20000, limit=1, timeout=5)
-        results["openaq"] = {"ok": True, "found": len(loc.get("results", []) or [])}
-    except Exception as e:
-        results["openaq"] = {"ok": False, "error": str(e)}
+    # OpenAQ removido
+    results["openaq"] = {"ok": False, "error": "OpenAQ removido do projeto"}
 
-    # 3) INPE
+    # INPE
     try:
-        focos = inpe_focos_near(DEFAULT_LAT, DEFAULT_LON, raio_km=50, scope="diario", region="Brasil", timeout=5)
-        results["inpe"] = {"ok": True, "count": len((focos.get("features") or {}).get("focos") or [])}
+        d = inpe_focos_near(
+            DEFAULT_LAT, DEFAULT_LON,
+            raio_km=50,
+            scope=INPE_DEFAULT_SCOPE,
+            region=INPE_DEFAULT_REGION,
+            timeout=5
+        )
+        count = len((d.get("features") or {}).get("focos") or [])
+        results["inpe"] = {"ok": True, "count": count}
     except Exception as e:
         results["inpe"] = {"ok": False, "error": str(e)}
 
@@ -2407,9 +2280,9 @@ def api_health_providers():
 
 
 # ------------------------------------------------------------
-# 15.4 — Testar geocodificação (cidade padrão)
+# 16.4 — Teste de Geocodificação
 # ------------------------------------------------------------
-@router_health.get("/health/geocode", summary="Testa geocodificação para cidade padrão")
+@router_health.get("/health/geocode", summary="Testa geocodificação")
 def api_health_geocode():
     try:
         info = geocode_city("Belém, PA")
@@ -2419,24 +2292,27 @@ def api_health_geocode():
 
 
 # ------------------------------------------------------------
-# 15.5 — Testar escrita mínima em disco (Render / Vercel)
+# 16.5 — Teste de escrita em disco
 # ------------------------------------------------------------
-@router_health.get("/health/disk", summary="Testa escrita no disco persistente (./runtime_data)")
+@router_health.get("/health/disk", summary="Testa escrita no disco persistente")
 def api_health_disk():
     try:
         d = "./runtime_data/healthcheck"
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "test.txt")
         ts = now_utc().isoformat()
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(ts)
+
         return {"ok": True, "file": path, "content": ts}
+
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
 # ------------------------------------------------------------
-# 15.6 — Teste de banco (SQLite)
+# 16.6 — Teste SQLite
 # ------------------------------------------------------------
 @router_health.get("/health/db", summary="Testa conexão com SQLite")
 def api_health_db():
@@ -2449,9 +2325,9 @@ def api_health_db():
 
 
 # ------------------------------------------------------------
-# 15.7 — Métricas simples para Prometheus
+# 16.7 — /metrics estilo Prometheus
 # ------------------------------------------------------------
-@router_health.get("/metrics", summary="Métricas básicas (Prometheus-like)")
+@router_health.get("/metrics", summary="Métricas simples estilo Prometheus")
 def api_metrics():
 
     metrics = {
@@ -2462,24 +2338,20 @@ def api_metrics():
         "default_lon": DEFAULT_LON,
     }
 
-    # converte para formato de texto do Prometheus
-    lines = []
-    for k, v in metrics.items():
-        lines.append(f"{k} {v}")
-
+    lines = [f"{k} {v}" for k, v in metrics.items()]
     return PlainTextResponse("\n".join(lines))
 
 
 # ------------------------------------------------------------
-# 15.8 — Registrar no app principal
+# 16.8 — Registrar router
 # ------------------------------------------------------------
 app.include_router(router_health)
 
-
 # ------------------------------------------------------------
-# Marcar início do servidor (para métricas de uptime)
+# 16.9 — Marcar início do servidor
 # ------------------------------------------------------------
 START_TIME = time.time()
+
 
 # ============================================================
 # 🧩 MÓDULO FINAL — Execução (Local / Render)
