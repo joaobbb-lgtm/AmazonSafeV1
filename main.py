@@ -1842,7 +1842,7 @@ def api_alertas_update(req: AlertUpdateRequest):
         }
         air_feat = {}
 
-    # --------------------------------------------------------
+       # --------------------------------------------------------
     # 4) Focos INPE
     # --------------------------------------------------------
     try:
@@ -1855,12 +1855,20 @@ def api_alertas_update(req: AlertUpdateRequest):
             limit=3000,
             timeout=HTTP_TIMEOUT,
         )
-        focos_lista = (focos_raw.get("features") or {}).get("focos") or []
     except Exception as e:
         focos_raw = {"erro": str(e)}
         focos_lista = []
-
-    meta_focos = (focos_raw.get("features") or {}).get("meta") or {}
+        meta_focos = {}
+    else:
+        # Tenta formato novo: {"features": {"focos": [...], "meta": {...}}}
+        features = focos_raw.get("features")
+        if isinstance(features, dict):
+            focos_lista = features.get("focos") or []
+            meta_focos = features.get("meta") or {}
+        else:
+            # Formato antigo: {"focos": [...], "meta": {...}}
+            focos_lista = focos_raw.get("focos") or []
+            meta_focos = focos_raw.get("meta") or {}
 
     focos_limpos = []
     for f in focos_lista:
@@ -1870,15 +1878,16 @@ def api_alertas_update(req: AlertUpdateRequest):
             dist = None
 
         focos_limpos.append({
-            "lat": f.get("latitude"),
-            "lon": f.get("longitude"),
+            "lat": f.get("latitude") or f.get("lat"),
+            "lon": f.get("longitude") or f.get("lon"),
             "dist_km": dist,
             "uf": f.get("uf"),
             "municipio": f.get("municipio"),
             "frp": f.get("frp"),
             "satelite": f.get("satelite"),
-            "data_hora_gmt": f.get("datahora"),
+            "data_hora_gmt": f.get("datahora") or f.get("data_hora_gmt"),
         })
+
 
     # --------------------------------------------------------
     # 5) Montagem do dicionário alert_obs
