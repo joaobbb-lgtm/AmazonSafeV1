@@ -1789,7 +1789,7 @@ def api_alertas_update(req: AlertUpdateRequest):
     """
 
     # --------------------------------------------------------
-    # 1) Resolucao da localizacao
+    # 1) Resolução da localização
     # --------------------------------------------------------
     try:
         lat, lon, loc_meta = _resolve_location(
@@ -1803,107 +1803,107 @@ def api_alertas_update(req: AlertUpdateRequest):
         raise HTTPException(400, f"Erro ao resolver localização: {e}")
 
     # --------------------------------------------------------
-    # 2) Clima atual
+    # 2) Clima atual (Open-Meteo + Air Quality bruto)
     # --------------------------------------------------------
     try:
         clima_now = collect_weather_now(lat, lon)
         clima_feat = clima_now.get("features") or {}
     except Exception as e:
-        clima_now = {"erro": str(e)}
+        clima_now = {
+            "ok": False,
+            "erro": str(e),
+            "fonte": "open-meteo",
+            "features": {}
+        }
         clima_feat = {}
 
     # --------------------------------------------------------
     # 3) Qualidade do ar (via Open-Meteo Air Quality)
     # --------------------------------------------------------
-    
-try:
-    air_now = {
-        "fonte": "open-meteo",
-        "features": {
-            "pm10": clima_feat.get("pm10"),
-            "pm25": clima_feat.get("pm25"),
-            "o3":   clima_feat.get("o3"),
-            "no2":  clima_feat.get("no2"),
-            "so2":  clima_feat.get("so2"),
-            "co":   clima_feat.get("co"),
-            "uv":   clima_feat.get("uv"),
+    try:
+        air_now = {
+            "fonte": "open-meteo",
+            "features": {
+                "pm10": clima_feat.get("pm10"),
+                "pm25": clima_feat.get("pm25"),
+                "o3":   clima_feat.get("o3"),
+                "no2":  clima_feat.get("no2"),
+                "so2":  clima_feat.get("so2"),
+                "co":   clima_feat.get("co"),
+                "uv":   clima_feat.get("uv"),
+            },
         }
-    }
-    air_feat = air_now["features"]
-except Exception as e:
-    air_now = {
-        "fonte": "open-meteo",
-        "erro": str(e),
-        "features": {}
-    }
-    air_feat = {}
-
+        air_feat = air_now["features"]
+    except Exception as e:
+        air_now = {
+            "fonte": "open-meteo",
+            "erro": str(e),
+            "features": {},
+        }
+        air_feat = {}
 
     # --------------------------------------------------------
     # 4) Focos INPE
     # --------------------------------------------------------
-    
-try:
-    focos_raw = inpe_focos_near(
-        lat=lat,
-        lon=lon,
-        raio_km=req.raio_km,
-        scope="diario",
-        region="Brasil",
-        limit=3000,
-        timeout=HTTP_TIMEOUT,
-    )
-    focos_lista = (focos_raw.get("features") or {}).get("focos") or []
-except Exception as e:
-    focos_raw = {"erro": str(e)}
-    focos_lista = []
-
-meta_focos = (focos_raw.get("features") or {}).get("meta") or {}
-
-focos_limpos = []
-for f in focos_lista:
     try:
-        dist = float(f.get("dist_km"))
-    except Exception:
-        dist = None
+        focos_raw = inpe_focos_near(
+            lat=lat,
+            lon=lon,
+            raio_km=req.raio_km,
+            scope="diario",
+            region="Brasil",
+            limit=3000,
+            timeout=HTTP_TIMEOUT,
+        )
+        focos_lista = (focos_raw.get("features") or {}).get("focos") or []
+    except Exception as e:
+        focos_raw = {"erro": str(e)}
+        focos_lista = []
 
-    focos_limpos.append({
-        "lat": f.get("latitude"),
-        "lon": f.get("longitude"),
-        "dist_km": dist,
-        "uf": f.get("uf"),
-        "municipio": f.get("municipio"),
-        "frp": f.get("frp"),
-        "satelite": f.get("satelite"),
-        "data_hora_gmt": f.get("datahora"),
-    })
+    meta_focos = (focos_raw.get("features") or {}).get("meta") or {}
 
+    focos_limpos = []
+    for f in focos_lista:
+        try:
+            dist = float(f.get("dist_km"))
+        except Exception:
+            dist = None
+
+        focos_limpos.append({
+            "lat": f.get("latitude"),
+            "lon": f.get("longitude"),
+            "dist_km": dist,
+            "uf": f.get("uf"),
+            "municipio": f.get("municipio"),
+            "frp": f.get("frp"),
+            "satelite": f.get("satelite"),
+            "data_hora_gmt": f.get("datahora"),
+        })
 
     # --------------------------------------------------------
     # 5) Montagem do dicionário alert_obs
     # --------------------------------------------------------
     alert_obs = {
-    # variáveis inseridas manualmente
-    "severity": req.severity,
-    "duration": req.duration,
-    "frequency": req.frequency,
-    "impact": req.impact,
+        # variáveis inseridas manualmente
+        "severity": req.severity,
+        "duration": req.duration,
+        "frequency": req.frequency,
+        "impact": req.impact,
 
-    # clima e precipitação
-    "precipitation": clima_feat.get("precipitation"),
-
-    "meta": {
+        # clima e precipitação
         "precipitation": clima_feat.get("precipitation"),
-    },
 
-    # ar — agora vindos do Open-Meteo
-    "pm25": air_feat.get("pm25"),
-    "pm10": air_feat.get("pm10"),
+        "meta": {
+            "precipitation": clima_feat.get("precipitation"),
+        },
 
-    # foco (quantidade total)
-    "focos_total": len(focos_limpos),
-}
+        # ar — agora vindos do Open-Meteo
+        "pm25": air_feat.get("pm25"),
+        "pm10": air_feat.get("pm10"),
 
+        # foco (quantidade total)
+        "focos_total": len(focos_limpos),
+    }
 
     # --------------------------------------------------------
     # 6) Score Inteligente
@@ -1958,9 +1958,8 @@ for f in focos_lista:
         "focos": {
             "total": len(focos_limpos),
             "items": focos_limpos,
-            "meta": meta_focos,  # ← AQUI!
+            "meta": meta_focos,
         },
-
         "alert_obs": alert_obs,
         "score": {
             "valor": score_res.score,
@@ -1968,6 +1967,7 @@ for f in focos_lista:
             "detalhes": score_res.breakdown,
         },
     }
+
 
 # ============================================================
 # 🧩 MÓDULO 14 — Rotas Administrativas / Diagnóstico (v2)
