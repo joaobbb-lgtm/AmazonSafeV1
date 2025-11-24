@@ -1584,21 +1584,19 @@ def api_data(req: DataRequest):
         )
 
     # ------------------------------------------------------------
-    # # 2) Clima atual
+    # 2) Clima atual (Open-Meteo + Air Quality)
     # ------------------------------------------------------------
-    
-try:
-    clima_now = collect_weather_now(lat, lon)
-    clima_feat = clima_now.get("features") or {}
-except Exception as e:
-    clima_now = {
-        "ok": False,
-        "erro": str(e),
-        "fonte": "open-meteo",
-        "features": {}
-    }
-    clima_feat = {}
-
+    try:
+        clima_now = collect_weather_now(lat, lon)
+        clima_feat = clima_now.get("features") or {}
+    except Exception as e:
+        clima_now = {
+            "ok": False,
+            "erro": str(e),
+            "fonte": "open-meteo",
+            "features": {}
+        }
+        clima_feat = {}
 
     # ------------------------------------------------------------
     # 3) Focos reais via backend (50 / 150 / 300 km)
@@ -1622,11 +1620,12 @@ except Exception as e:
         },
         "clima_atual": {
             "fonte": "open-meteo",
-            "features": clima,
-            "raw": clima_raw
+            "features": clima_feat,   # dados normalizados
+            "raw": clima_now          # payload completo retornado por collect_weather_now
         },
         "focos_reais": focos,
     }
+
 # ============================================================
 # 🧩 MÓDULO 12 — ENDPOINT /api/data_auto (Dashboard + IA v10)
 # ============================================================
