@@ -459,16 +459,30 @@ def inpe_focos_near(lat, lon, raio_km=150, scope="diario", region="Brasil", limi
     if limit:
         sub = sub.head(int(limit))
 
-    focos = []
-    for _, r in sub.iterrows():
-        focos.append({
-            "latitude": _json_safe(r.get("latitude")),
-            "longitude": _json_safe(r.get("longitude")),
-            "datahora": _json_safe(r.get("datahora")),
-            "satelite": _json_safe(r.get("satelite")),
-            "frp": _json_safe(r.get("frp")),
-            "dist_km": _json_safe(r.get("dist_km")),
+    focos_limpos = []
+    for f in focos_lista:
+        try:
+            dist = float(f.get("dist_km"))
+        except Exception:
+            dist = None
+    
+        focos_limpos.append({
+            # usa latitude/longitude do Módulo 3
+            "lat": f.get("latitude"),
+            "lon": f.get("longitude"),
+    
+            "dist_km": dist,
+            "uf": f.get("uf"),  # se existir
+            "municipio": f.get("municipio"),  # se existir
+    
+            "frp": f.get("frp"),
+            "satelite": f.get("satelite"),
+    
+            # usa datahora do Módulo 3
+            "data_hora_gmt": f.get("datahora"),
         })
+
+
 
     meta = {
         "source": "inpe_csv",
@@ -1570,14 +1584,21 @@ def api_data(req: DataRequest):
         )
 
     # ------------------------------------------------------------
-    # 2) Clima atual (usando o novo get_meteo)
+    # # 2) Clima atual
     # ------------------------------------------------------------
-    try:
-        clima_raw = get_meteo(lat, lon)
-        clima = normalize_meteo(clima_raw)
-    except Exception as e:
-        clima = {}
-        clima_raw = {"erro": str(e)}
+    
+try:
+    clima_now = collect_weather_now(lat, lon)
+    clima_feat = clima_now.get("features") or {}
+except Exception as e:
+    clima_now = {
+        "ok": False,
+        "erro": str(e),
+        "fonte": "open-meteo",
+        "features": {}
+    }
+    clima_feat = {}
+
 
     # ------------------------------------------------------------
     # 3) Focos reais via backend (50 / 150 / 300 km)
@@ -1786,82 +1807,104 @@ def api_alertas_update(req: AlertUpdateRequest):
     # 2) Clima atual
     # --------------------------------------------------------
     try:
-        clima_now = collect_weather_now(...)
+        clima_now = collect_weather_now(lat, lon)
         clima_feat = clima_now.get("features") or {}
     except Exception as e:
         clima_now = {"erro": str(e)}
         clima_feat = {}
 
     # --------------------------------------------------------
-    # 3) Qualidade do ar
+    # 3) Qualidade do ar (via Open-Meteo Air Quality)
     # --------------------------------------------------------
-    try:
-        air_now   = {"fonte": "none", "features": {"pm25": None, "pm10": None}}
-        air_feat = air_now.get("features") or {}
-    except Exception as e:
-        air_now = {"erro": str(e)}
-        air_feat = {}
+    
+try:
+    air_now = {
+        "fonte": "open-meteo",
+        "features": {
+            "pm10": clima_feat.get("pm10"),
+            "pm25": clima_feat.get("pm25"),
+            "o3":   clima_feat.get("o3"),
+            "no2":  clima_feat.get("no2"),
+            "so2":  clima_feat.get("so2"),
+            "co":   clima_feat.get("co"),
+            "uv":   clima_feat.get("uv"),
+        }
+    }
+    air_feat = air_now["features"]
+except Exception as e:
+    air_now = {
+        "fonte": "open-meteo",
+        "erro": str(e),
+        "features": {}
+    }
+    air_feat = {}
+
 
     # --------------------------------------------------------
     # 4) Focos INPE
     # --------------------------------------------------------
+    
+try:
+    focos_raw = inpe_focos_near(
+        lat=lat,
+        lon=lon,
+        raio_km=req.raio_km,
+        scope="diario",
+        region="Brasil",
+        limit=3000,
+        timeout=HTTP_TIMEOUT,
+    )
+    focos_lista = (focos_raw.get("features") or {}).get("focos") or []
+except Exception as e:
+    focos_raw = {"erro": str(e)}
+    focos_lista = []
+
+meta_focos = (focos_raw.get("features") or {}).get("meta") or {}
+
+focos_limpos = []
+for f in focos_lista:
     try:
-        focos_raw = inpe_focos_near(
-            lat=lat,
-            lon=lon,
-            raio_km=req.raio_km,
-            scope="diario",
-            region="Brasil",
-            limit=3000,
-            timeout=HTTP_TIMEOUT,
-        )
-        focos_lista = (focos_raw.get("features") or {}).get("focos") or []
-    except Exception as e:
-        focos_raw = {"erro": str(e)}
-        focos_lista = []
+        dist = float(f.get("dist_km"))
+    except Exception:
+        dist = None
 
-    focos_limpos = []
-    for f in focos_lista:
-        try:
-            dist = float(f.get("dist_km"))
-        except Exception:
-            dist = None
+    focos_limpos.append({
+        "lat": f.get("latitude"),
+        "lon": f.get("longitude"),
+        "dist_km": dist,
+        "uf": f.get("uf"),
+        "municipio": f.get("municipio"),
+        "frp": f.get("frp"),
+        "satelite": f.get("satelite"),
+        "data_hora_gmt": f.get("datahora"),
+    })
 
-        focos_limpos.append({
-            "lat": f.get("lat"),
-            "lon": f.get("lon"),
-            "dist_km": dist,
-            "uf": f.get("uf"),
-            "municipio": f.get("municipio"),
-            "frp": f.get("frp"),
-            "satelite": f.get("satelite"),
-            "data_hora_gmt": f.get("data_hora_gmt"),
-        })
 
     # --------------------------------------------------------
     # 5) Montagem do dicionário alert_obs
     # --------------------------------------------------------
     alert_obs = {
-        # variáveis inseridas manualmente
-        "severity": req.severity,
-        "duration": req.duration,
-        "frequency": req.frequency,
-        "impact": req.impact,
+    # variáveis inseridas manualmente
+    "severity": req.severity,
+    "duration": req.duration,
+    "frequency": req.frequency,
+    "impact": req.impact,
 
-        # clima e precipitação
+    # clima e precipitação
+    "precipitation": clima_feat.get("precipitation"),
+
+    "meta": {
         "precipitation": clima_feat.get("precipitation"),
+    },
 
-        "meta": {
-            "precipitation": clima_feat.get("precipitation"),
-        },
+    # ar — agora vindos do Open-Meteo
+    "pm25": air_feat.get("pm25"),
+    "pm10": air_feat.get("pm10"),
 
-        # ar
-        "pm25": air_feat.get("pm25"),
-        "pm10": air_feat.get("pm10"),
+    # foco (quantidade total)
+    "focos_total": len(focos_limpos),
+}
 
-        # foco (quantidade total)
-        "focos_total": len(focos_limpos),
-    }
 
     # --------------------------------------------------------
     # 6) Score Inteligente
@@ -1916,7 +1959,9 @@ def api_alertas_update(req: AlertUpdateRequest):
         "focos": {
             "total": len(focos_limpos),
             "items": focos_limpos,
+            "meta": meta_focos,  # ← AQUI!
         },
+
         "alert_obs": alert_obs,
         "score": {
             "valor": score_res.score,
