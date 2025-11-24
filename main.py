@@ -364,7 +364,7 @@ from io import BytesIO
 def parse_float_safe(x):
     try:
         return float(str(x).replace(",", "."))
-    except:
+    except Exception:
         return None
 
 def _deg_per_km_lat():
@@ -392,12 +392,16 @@ def inpe_fetch_csv(scope="diario", region="Brasil", timeout=HTTP_TIMEOUT):
     r = http_get(url, timeout=timeout)
     try:
         df = pd.read_csv(BytesIO(r.content), encoding="utf-8")
-    except:
+    except Exception:
         df = pd.read_csv(BytesIO(r.content), encoding="latin1")
 
     return {"df": df, "url": url, "ref": str(ref)}
 
-def _canonical_inpe_columns(df):
+def _canonical_inpe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza as colunas principais do CSV do INPE.
+    Tenta vários nomes possíveis para latitude/longitude, data, etc.
+    """
     cols = {c.lower(): c for c in df.columns}
 
     def pick(*names):
@@ -408,37 +412,67 @@ def _canonical_inpe_columns(df):
 
     c_lat = pick("latitude","lat","y")
     c_lon = pick("longitude","lon","x")
-    c_dt  = pick("datahora","data_hora")
+    c_dt  = pick("datahora","data_hora","data_hora_gmt")
     c_sat = pick("satelite","satellite")
     c_frp = pick("frp","radiative_power")
+    c_uf  = pick("uf","estado","state")
+    c_mun = pick("municipio","município","city","nome_munic","municipality")
 
     out = pd.DataFrame()
+
     out["latitude"] = df[c_lat] if c_lat else None
     out["longitude"] = df[c_lon] if c_lon else None
     out["datahora"] = df[c_dt] if c_dt else None
     out["satelite"] = df[c_sat] if c_sat else None
     out["frp"] = df[c_frp] if c_frp else None
+
+    # campos opcionais
+    if c_uf:
+        out["uf"] = df[c_uf]
+    else:
+        out["uf"] = None
+
+    if c_mun:
+        out["municipio"] = df[c_mun]
+    else:
+        out["municipio"] = None
+
     return out
 
 def _json_safe(v):
     try:
         if pd.isna(v):
             return None
-    except:
+    except Exception:
         pass
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
     return v
 
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
-def inpe_focos_near(lat, lon, raio_km=150, scope="diario", region="Brasil", limit=1000, timeout=HTTP_TIMEOUT):
+def inpe_focos_near(
+    lat,
+    lon,
+    raio_km: float = 150,
+    scope: str = "diario",
+    region: str = "Brasil",
+    limit: int = 1000,
+    timeout: int = HTTP_TIMEOUT,
+):
+    """
+    Retorna focos do INPE próximos ao ponto (lat, lon),
+    dentro de um raio em km.
+    """
+
     payload = inpe_fetch_csv(scope=scope, region=region, timeout=timeout)
     df = payload["df"]
     norm = _canonical_inpe_columns(df)
 
+    # Converte para float seguro
     norm["latitude"] = norm["latitude"].map(parse_float_safe)
     norm["longitude"] = norm["longitude"].map(parse_float_safe)
 
+    # Filtra por bounding box aproximado
     minx, miny, maxx, maxy = bbox_from_center(lat, lon, float(raio_km))
     mask = (
         (norm["longitude"].notna()) &
@@ -450,39 +484,32 @@ def inpe_focos_near(lat, lon, raio_km=150, scope="diario", region="Brasil", limi
     )
     sub = norm[mask].copy()
 
+    # Distância exata em km (se a função existir)
     try:
-        sub["dist_km"] = sub.apply(lambda r: haversine_km(lat, lon, r["latitude"], r["longitude"]), axis=1)
+        sub["dist_km"] = sub.apply(
+            lambda r: haversine_km(lat, lon, r["latitude"], r["longitude"]),
+            axis=1
+        )
         sub = sub[sub["dist_km"] <= float(raio_km)]
-    except:
+    except Exception:
+        # Se der erro em haversine_km, segue sem a filtragem fina
         pass
 
     if limit:
         sub = sub.head(int(limit))
 
-    focos_limpos = []
-    for f in focos_lista:
-        try:
-            dist = float(f.get("dist_km"))
-        except Exception:
-            dist = None
-    
-        focos_limpos.append({
-            # usa latitude/longitude do Módulo 3
-            "lat": f.get("latitude"),
-            "lon": f.get("longitude"),
-    
-            "dist_km": dist,
-            "uf": f.get("uf"),  # se existir
-            "municipio": f.get("municipio"),  # se existir
-    
-            "frp": f.get("frp"),
-            "satelite": f.get("satelite"),
-    
-            # usa datahora do Módulo 3
-            "data_hora_gmt": f.get("datahora"),
+    focos = []
+    for _, r in sub.iterrows():
+        focos.append({
+            "latitude": _json_safe(r.get("latitude")),
+            "longitude": _json_safe(r.get("longitude")),
+            "datahora": _json_safe(r.get("datahora")),
+            "satelite": _json_safe(r.get("satelite")),
+            "frp": _json_safe(r.get("frp")),
+            "uf": _json_safe(r.get("uf")) if "uf" in r else None,
+            "municipio": _json_safe(r.get("municipio")) if "municipio" in r else None,
+            "dist_km": _json_safe(r.get("dist_km")),
         })
-
-
 
     meta = {
         "source": "inpe_csv",
@@ -498,8 +525,9 @@ def inpe_focos_near(lat, lon, raio_km=150, scope="diario", region="Brasil", limi
         "payload": {"csv_url": payload["url"]},
     }
 
+
 # ============================================================
-# 3.6 — NORMALIZADORES
+#MÓDULO 4 — NORMALIZADORES
 # ============================================================
 
 def normalize_meteo(data: dict) -> dict:
@@ -511,26 +539,7 @@ def normalize_meteo(data: dict) -> dict:
             out[k] = None
     return out
 
-# ============================================================
-# MÓDULO 4 — Funções auxiliares INPE (bbox / parsing)
-# ============================================================
 
-def _deg_per_km_lat():
-    return 1.0 / 111.32
-
-def _deg_per_km_lon(lat: float):
-    return 1.0 / (111.32 * max(0.01, math.cos(math.radians(lat))))
-
-def bbox_from_center(lat, lon, raio_km):
-    dlat = raio_km * _deg_per_km_lat()
-    dlon = raio_km * _deg_per_km_lon(lat)
-    return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
-
-def parse_float_safe(x):
-    try:
-        return float(str(x).replace(",", "."))
-    except:
-        return None
 
 # ============================================================
 # MÓDULO 5 — Inicialização da API FastAPI
