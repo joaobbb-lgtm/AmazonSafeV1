@@ -2855,6 +2855,41 @@ from typing import Dict, Any
 from datetime import datetime
 from fastapi import APIRouter
 
+# ============================================================
+# HOTFIX — Logger Global de Erros (captura tracebacks do FastAPI)
+# ============================================================
+
+import traceback
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class ErrorLoggerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as e:
+            tb = traceback.format_exc()
+
+            # grava em arquivo ndjson
+            log_event(
+                "exception",
+                str(e),
+                {
+                    "path": request.url.path,
+                    "method": request.method,
+                    "traceback": tb,
+                }
+            )
+
+            # também printa no console (Render mostra isso)
+            print("\n\n[EXCEPTION] ===============================")
+            print(tb)
+            print("==========================================\n\n")
+
+            raise e
+
+# registrar middleware
+app.add_middleware(ErrorLoggerMiddleware)
+
 router_logs = APIRouter(prefix="/logs", tags=["Logs"])
 
 # ------------------------------------------------------------
