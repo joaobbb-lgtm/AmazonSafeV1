@@ -977,23 +977,6 @@ import pandas as pd
 import requests
 from fastapi import HTTPException
 
-# Importa helpers essenciais (sem SQLModel)
-from main import (
-    safe_float,
-    coalesce,
-    now_utc,
-)
-
-# Importa funções de meteo do módulo responsável
-from main import get_meteo, normalize_meteo
-
-# Importa helpers geográficos existentes no projeto
-from main import (
-    bbox_from_center,
-    haversine_km,
-    parse_float_safe,
-    ttl_cache,
-)
 
 # Defaults gerais
 DEFAULT_LAT = -1.45056
@@ -1161,7 +1144,6 @@ def deter_stats(lat: float, lon: float, raio_km: float = 150.0) -> Dict[str, Any
 INPE_DEFAULT_SCOPE  = "diario"
 INPE_DEFAULT_REGION = "Brasil"
 
-from main import inpe_focos_near  # mesma função já existente
 
 
 def focos_stats(lat: float, lon: float, raio_km: float = 150.0,
@@ -1863,14 +1845,6 @@ except Exception as e:
 # ============================================================
 
 from typing import Dict, Any
-
-# Importa utilidades do Módulo 7 (fonte oficial)
-from main import (
-    get_meteo,
-    normalize_meteo,
-    focos_por_raios_backend,
-    get_deter_data,
-)
 
 
 # ------------------------------------------------------------
