@@ -1367,47 +1367,39 @@ def _build_feature_vector(payload: Dict[str, Any]) -> np.ndarray:
 # 8.4 — Função de previsão (usada pelo Módulo 9)
 # ------------------------------------------------------------
 
-def run_ml_model(ctx: dict) -> dict:
-    """
-    Recebe contexto do Módulo 7:
-      { location{}, meteo{}, ... }
-
-    Retorna:
-      { ml_raw: float, ml_level: str }
-    """
-
-    if modelo_pipeline is None:
-        return {"ml_raw": 0.0, "ml_level": "desconhecido"}
-
-    loc = ctx.get("location", {})
-    met = ctx.get("meteo", {})
-
-    # Monta payload unificado
-    payload = met.copy()
-    payload["latitude"] = loc.get("lat")
-    payload["longitude"] = loc.get("lon")
-
-    X = _build_feature_vector(payload)
-
-    try:
-        pred = float(modelo_pipeline.predict(X)[0])
-    except Exception as e:
-        print("[run_ml_model] ERRO:", e)
-        return {"ml_raw": 0.0, "ml_level": "erro"}
-
-    ml_raw = max(0.0, min(1.0, pred))
-
-    if ml_raw < 0.33:
-        level = "Baixo"
-    elif ml_raw < 0.66:
-        level = "Médio"
-    else:
-        level = "Alto"
-
-    return {
-        "ml_raw": ml_raw,
-        "ml_level": level,
-    }
+    def run_ml_model(ctx: dict) -> dict:
+    
+        if modelo_pipeline is None:
+            return {"ml_raw": 0.0, "ml_level": "modelo_indisponivel"}
+    
+        loc = ctx.get("location", {})
+        met = ctx.get("meteo", {})
+    
+        # Payload seguro
+        payload = met.copy()
+        payload["latitude"] = float(loc.get("lat") or 0.0)
+        payload["longitude"] = float(loc.get("lon") or 0.0)
+    
+        X = _build_feature_vector(payload)
+    
+        try:
+            pred = float(modelo_pipeline.predict(X)[0])
+        except Exception as e:
+            print("[run_ml_model] ERRO:", e)
+            return {"ml_raw": 0.0, "ml_level": "erro"}
+    
+        ml_raw = max(0.0, min(1.0, pred))
+    
+        level = (
+            "Baixo" if ml_raw < 0.33
+            else "Médio" if ml_raw < 0.66
+            else "Alto"
+        )
+    
+        return {
+            "ml_raw": ml_raw,
+            "ml_level": level,
+        }
 
 
 # ------------------------------------------------------------
@@ -1737,9 +1729,15 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
     heuristic_raw, heuristic_level = _extract_heuristic_from_ctx(ctx)
     heuristic_norm = heuristic_raw / 100.0
 
-    # --- ML ---
-    ml_raw = float(ctx.get("ml_raw", 0.0))
+       # --- ML ---
+    ml_val = ctx.get("ml_raw")
+    try:
+        ml_raw = float(ml_val) if ml_val is not None else 0.0
+    except:
+        ml_raw = 0.0
+    
     ml_norm = _clip01(ml_raw)
+
 
     # --- Alertas ---
     alert_params = ctx.get("alert_params") or {}
@@ -1820,8 +1818,8 @@ def build_observation_context(cidade=None, lat=None, lon=None, raio_km=150,
             "level": None,
             "components": {}
         },
-        "ml_raw": None,
-        "ml_level": None,
+        "ml_raw": 0.0,
+        "ml_level": "desconhecido",
     }
 
 # ============================================================
@@ -1876,12 +1874,64 @@ except Exception as e:
 # ============================================================
 
 from typing import Dict, Any
+from math import radians, sin, cos, sqrt, atan2
+
+
+# ------------------------------------------------------------
+# Função auxiliar — distância haversine (km)
+# ------------------------------------------------------------
+def _haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+# ------------------------------------------------------------
+# 10.0 — focos_por_raios_backend (NOVO — substitui o antigo)
+# ------------------------------------------------------------
+def focos_por_raios_backend(lat: float, lon: float) -> Dict[str, int]:
+    """
+    Nova versão mínima v11:
+    usa inpe_focos_near() e separa os focos por raio.
+    """
+    try:
+        geo = inpe_focos_near(lat, lon, 300)  # busca até 300 km
+        feats = geo.get("features", {}).get("data", [])
+    except Exception:
+        return {"focos_50km": 0, "focos_150km": 0, "focos_300km": 0}
+
+    f50 = f150 = f300 = 0
+
+    for f in feats:
+        props = f.get("properties", {})
+        flat = props.get("latitude")
+        flon = props.get("longitude")
+
+        if flat is None or flon is None:
+            continue
+
+        d = _haversine_km(lat, lon, flat, flon)
+
+        if d <= 50:
+            f50 += 1
+        if d <= 150:
+            f150 += 1
+        if d <= 300:
+            f300 += 1
+
+    return {
+        "focos_50km": f50,
+        "focos_150km": f150,
+        "focos_300km": f300,
+    }
 
 
 # ------------------------------------------------------------
 # 10.1 — Coletor de clima atual (Open-Meteo + Normalização)
 # ------------------------------------------------------------
-
 def collect_weather_now(lat: float, lon: float) -> Dict[str, Any]:
     """Coleta clima atual e padroniza para o dashboard v11."""
     try:
@@ -1904,9 +1954,8 @@ def collect_weather_now(lat: float, lon: float) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# 10.2 — Coletor de focos
+# 10.2 — Coletor de focos (corrigido)
 # ------------------------------------------------------------
-
 def collect_focos_now(lat: float, lon: float) -> Dict[str, Any]:
     """Coleta número de focos reais em 50/150/300 km."""
     try:
@@ -1927,7 +1976,6 @@ def collect_focos_now(lat: float, lon: float) -> Dict[str, Any]:
 # ------------------------------------------------------------
 # 10.3 — Coletor de DETER (últimas detecções)
 # ------------------------------------------------------------
-
 def collect_deter_now(lat: float, lon: float, raio_km: int = 150) -> Dict[str, Any]:
     """
     Coleta últimas detecções DETER (backend módulo 7).
@@ -1951,7 +1999,6 @@ def collect_deter_now(lat: float, lon: float, raio_km: int = 150) -> Dict[str, A
 # ------------------------------------------------------------
 # 10.4 — Bundle unificado para dashboards (v11)
 # ------------------------------------------------------------
-
 def collect_dashboard_bundle(lat: float, lon: float, raio_km: int = 150) -> Dict[str, Any]:
     """
     Pacote unificado (clima + ar + solo + focos + DETER) para dashboards.
@@ -2708,12 +2755,9 @@ def api_metrics():
     }
     return PlainTextResponse("\n".join(f"{k} {v}" for k, v in metrics.items()))
 
-app.include_router(router_health)
-
 # ============================================================
-# HEALTH CHECK — geocode
+# HEALTH CHECK — geocode  (🔧 agora ANTES do include_router)
 # ============================================================
-
 @router_health.get("/health/geocode")
 def system_geocode_test(city: str = "Belém"):
     try:
@@ -2723,6 +2767,10 @@ def system_geocode_test(city: str = "Belém"):
         return {"ok": True, "result": geo}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# Agora sim — só depois incluímos o router
+app.include_router(router_health)
+
 # ============================================================
 # 🧩 MÓDULO 17 — Execução Local / Compatibilidade Render (v11)
 # ============================================================
