@@ -273,19 +273,7 @@ def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
         "display_name": f"Fallback {raw_q} → Belém/PA",
         "source": "fallback",
     }
-# ============================================================
-# HEALTH CHECK — geocode
-# ============================================================
 
-@router_health.get("/health/geocode")
-def system_geocode_test(city: str = "Belém"):
-    try:
-        geo = geocode_city(city)
-        if not geo:
-            return {"ok": False, "error": "geocode returned None"}
-        return {"ok": True, "result": geo}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 
 # ============================================================
@@ -1805,6 +1793,36 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
         },
     )
 
+# ============================================================
+# Função essencial — build_observation_context (mínima v11)
+# ============================================================
+def build_observation_context(cidade=None, lat=None, lon=None, raio_km=150,
+                              meteo=None, focos=None, deter=None):
+    """
+    Versão mínima funcional para v11.
+    Garante estrutura usada pelos endpoints e modelo.
+    """
+    # monta estrutura compatível com o restante do código
+    return {
+        "location": {
+            "cidade": cidade,
+            "lat": lat,
+            "lon": lon,
+            "radius_km": raio_km,
+            "resolved_by": "direct",
+            "display_name": cidade or f"{lat},{lon}"
+        },
+        "meteo": meteo or {},
+        "focos": focos or {},
+        "deter": deter or {},
+        "conservation": {
+            "score": None,
+            "level": None,
+            "components": {}
+        },
+        "ml_raw": None,
+        "ml_level": None,
+    }
 
 # ============================================================
 # 9.6 — ENDPOINT OFICIAL /api/score_final
@@ -1951,36 +1969,6 @@ def collect_dashboard_bundle(lat: float, lon: float, raio_km: int = 150) -> Dict
         "deter": deter,
     }
 
-# ============================================================
-# Função essencial — build_observation_context (mínima v11)
-# ============================================================
-def build_observation_context(cidade=None, lat=None, lon=None, raio_km=150,
-                              meteo=None, focos=None, deter=None):
-    """
-    Versão mínima funcional para v11.
-    Garante estrutura usada pelos endpoints e modelo.
-    """
-    # monta estrutura compatível com o restante do código
-    return {
-        "location": {
-            "cidade": cidade,
-            "lat": lat,
-            "lon": lon,
-            "radius_km": raio_km,
-            "resolved_by": "direct",
-            "display_name": cidade or f"{lat},{lon}"
-        },
-        "meteo": meteo or {},
-        "focos": focos or {},
-        "deter": deter or {},
-        "conservation": {
-            "score": None,
-            "level": None,
-            "components": {}
-        },
-        "ml_raw": None,
-        "ml_level": None,
-    }
 
 # ============================================================
 # 🧩 MÓDULO 11 — ENDPOINT /api/data (Dashboard v11)
@@ -2722,7 +2710,19 @@ def api_metrics():
 
 app.include_router(router_health)
 
+# ============================================================
+# HEALTH CHECK — geocode
+# ============================================================
 
+@router_health.get("/health/geocode")
+def system_geocode_test(city: str = "Belém"):
+    try:
+        geo = geocode_city(city)
+        if not geo:
+            return {"ok": False, "error": "geocode returned None"}
+        return {"ok": True, "result": geo}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 # ============================================================
 # 🧩 MÓDULO 17 — Execução Local / Compatibilidade Render (v11)
 # ============================================================
