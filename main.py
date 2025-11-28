@@ -123,23 +123,28 @@ OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "f6713d7b945cc5d989cdc08bcb44b62c0f
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 # ============================================================
-# 3.1 — GEOCODING (Nominatim + Open-Meteo fallback)
+# 3.1 — GEOCODING (Nominatim + Open-Meteo + Fallback Belém)
 # ============================================================
 
 UF2STATE = {
-    "AC":"Acre","AL":"Alagoas","AP":"Amapá","AM":"Amazonas","BA":"Bahia",
-    "CE":"Ceará","DF":"Distrito Federal","ES":"Espírito Santo","GO":"Goiás",
-    "MA":"Maranhão","MT":"Mato Grosso","MS":"Mato Grosso do Sul","MG":"Minas Gerais",
-    "PA":"Pará","PB":"Paraíba","PR":"Paraná","PE":"Pernambuco","PI":"Piauí",
-    "RJ":"Rio de Janeiro","RN":"Rio Grande do Norte","RS":"Rio Grande do Sul",
-    "RO":"Rondônia","RR":"Roraima","SC":"Santa Catarina","SP":"São Paulo",
-    "SE":"Sergipe","TO":"Tocantins"
+    "AC": "Acre", "AL": "Alagoas", "AP": "Amapá", "AM": "Amazonas", "BA": "Bahia",
+    "CE": "Ceará", "DF": "Distrito Federal", "ES": "Espírito Santo", "GO": "Goiás",
+    "MA": "Maranhão", "MT": "Mato Grosso", "MS": "Mato Grosso do Sul", "MG": "Minas Gerais",
+    "PA": "Pará", "PB": "Paraíba", "PR": "Paraná", "PE": "Pernambuco", "PI": "Piauí",
+    "RJ": "Rio de Janeiro", "RN": "Rio Grande do Norte", "RS": "Rio Grande do Sul",
+    "RO": "Rondônia", "RR": "Roraima", "SC": "Santa Catarina", "SP": "São Paulo",
+    "SE": "Sergipe", "TO": "Tocantins"
 }
+
+GEOCODE_UA = "AmazonSafe/3 (contato: joaobbb@gmail.com; https://amazonsafe-api.onrender.com)"
+GEO_TIMEOUT = 8  # timeouts mais curtos para não travar o backend
+
 
 def _split_city_state(q: str):
     s = q.strip()
     m = re.split(r"\s*[,;-]\s*|\s{2,}", s, maxsplit=1)
-    return (m[0].strip(), m[1].strip()) if len(m)==2 else (s, None)
+    return (m[0].strip(), m[1].strip()) if len(m) == 2 else (s, None)
+
 
 def _normalize_state(st):
     if not st:
@@ -152,13 +157,24 @@ def _normalize_state(st):
             return (uf, name)
     return (None, st)
 
-def _geocode_nominatim(q, state_name):
+
+def _geocode_nominatim(q: str, state_name: str | None):
+    """
+    Tenta geocodificar via Nominatim (OpenStreetMap).
+    Retorna dict com lat, lon, display_name ou None.
+    """
     try:
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": q, "format":"jsonv2", "addressdetails":1, "limit":5, "countrycodes":"br"},
+            params={
+                "q": q,
+                "format": "jsonv2",
+                "addressdetails": 1,
+                "limit": 5,
+                "countrycodes": "br",
+            },
             headers={"User-Agent": GEOCODE_UA},
-            timeout=HTTP_TIMEOUT
+            timeout=GEO_TIMEOUT,
         )
         r.raise_for_status()
         arr = r.json() or []
@@ -170,9 +186,13 @@ def _geocode_nominatim(q, state_name):
             lat, lon = it.get("lat"), it.get("lon")
             if not lat or not lon:
                 continue
+
             s = 1
-            if state_name and state_name.lower() in (it.get("address") or {}).get("state","").lower():
+            addr = (it.get("address") or {})
+            st_name = addr.get("state", "")
+            if state_name and state_name.lower() in st_name.lower():
                 s += 2
+
             if s > score:
                 best, score = it, s
 
@@ -181,45 +201,77 @@ def _geocode_nominatim(q, state_name):
                 "lat": float(best["lat"]),
                 "lon": float(best["lon"]),
                 "display_name": best.get("display_name"),
-                "source": "nominatim"
+                "source": "nominatim",
             }
-    except:
-        pass
+    except Exception as e:
+        print("[GEOCODE] Nominatim falhou:", e)
     return None
 
-def geocode_city(raw_q: str):
-    if not raw_q.strip():
+
+def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
+    """
+    Geocodificador robusto com 3 estágios:
+      1) Nominatim (OpenStreetMap)
+      2) Open-Meteo Geocoding
+      3) Fallback: Belém (DEFAULT_LAT/DEFAULT_LON)
+
+    Nunca levanta erro para o chamador — sempre retorna dict.
+    """
+
+    if not raw_q or not raw_q.strip():
         return None
 
+    raw_q = raw_q.strip()
     city, st = _split_city_state(raw_q)
     uf, state_name = _normalize_state(st)
 
-    # 1) Tenta Nominatim
-    q = f"{city}, {state_name}, Brasil" if state_name else city
+    # 1) Nominatim
+    q = f"{city}, {state_name}, Brasil" if state_name else f"{city}, Brasil"
     res = _geocode_nominatim(q, state_name)
     if res:
         return res
 
-    # 2) Fallback Open-Meteo geocoder
+    # 2) Open-Meteo Geocoding
     try:
         r = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 10, "language": "pt", "country": "BR"},
-            timeout=HTTP_TIMEOUT
+            params={
+                "name": city,
+                "count": 1,
+                "language": "pt",
+                "country": "BR",
+            },
+            timeout=GEO_TIMEOUT,
         )
-        arr = (r.json() or {}).get("results") or []
+        data = r.json() or {}
+        arr = data.get("results") or []
         if arr:
             best = arr[0]
             return {
-                "lat": best["latitude"],
-                "lon": best["longitude"],
-                "display_name": f"{best['name']}, {best.get('admin1','')}",
-                "source": "open-meteo"
+                "lat": float(best["latitude"]),
+                "lon": float(best["longitude"]),
+                "display_name": f"{best.get('name')}, {best.get('admin1', '')}",
+                "source": "open-meteo",
             }
-    except:
-        pass
+    except Exception as e:
+        print("[GEOCODE] Open-Meteo falhou:", e)
 
-    return None
+    # 3) Fallback seguro: Belém/PA
+    try:
+        lat = float(DEFAULT_LAT)
+        lon = float(DEFAULT_LON)
+    except Exception:
+        lat, lon = -1.45056, -48.4682453  # hardcoded caso env quebre
+
+    print(f"[GEOCODE] Fallback para Belém/PA para '{raw_q}'")
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "display_name": f"Fallback {raw_q} → Belém/PA",
+        "source": "fallback",
+    }
+
 
 # ============================================================
 # 3.2 — HTTP SESSION COM RETRY
