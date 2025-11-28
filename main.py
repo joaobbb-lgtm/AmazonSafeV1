@@ -774,16 +774,6 @@ app.add_middleware(
 
 print("Configuração do AmazonSafe API carregada com sucesso.")
 
-# ============================================================
-# 🔧 Inicialização obrigatória do SQLite (criação das tabelas)
-# ============================================================
-try:
-    print("🔧 Inicializando tabelas SQLite...")
-    SQLModel.metadata.create_all(engine)
-    print("✔ Banco inicializado (tabelas OK).")
-except Exception as e:
-    print("❌ ERRO ao criar tabelas SQLite:", e)
-
 
 # ------------------------------------------------------------
 # HEALTHCHECK / ROOT
@@ -1541,12 +1531,6 @@ import statistics as stats
 from fastapi import HTTPException
 from sqlmodel import Session, select
 
-# Importações diretas (evita import circular do main)
-from main import engine
-from main import WeatherObs
-from main import build_observation_context
-from main import run_ml_model
-
 
 # ------------------------------------------------------------
 # 9.0 — Limiares / Pesos do Score Final
@@ -1865,7 +1849,15 @@ def api_score_final(body: RiskRequest):
         "breakdown": final.breakdown,
     }
 
-
+# ============================================================
+# 🔧 Inicialização obrigatória do SQLite (criação das tabelas)
+# ============================================================
+try:
+    print("🔧 Inicializando tabelas SQLite...")
+    SQLModel.metadata.create_all(engine)
+    print("✔ Banco inicializado (tabelas OK).")
+except Exception as e:
+    print("❌ ERRO ao criar tabelas SQLite:", e)
 # ============================================================
 # 🧩 MÓDULO 10 — COLETORES OTIMIZADOS PARA O DASHBOARD (v11)
 # ============================================================
@@ -2351,6 +2343,7 @@ def api_alertas_update(req: AlertUpdateRequest):
 from fastapi import APIRouter
 
 router_admin = APIRouter(prefix="/admin", tags=["Admin"])
+app.include_router(router_admin)
 
 # ------------------------------------------------------------
 # 14.1 — Status geral
