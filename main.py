@@ -1873,6 +1873,88 @@ def focos_por_raios_backend(lat: float, lon: float):
         "focos_300km": f300,
     }
 
+# ============================================================
+# 8.6 — Persistência SQLite (WeatherObs / FireObs / AlertScore)
+# ============================================================
+
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from typing import Optional
+from datetime import datetime
+
+DB_URL = "sqlite:///./amazonsafe.db"
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+
+# ------------------------------------------------------------
+# Tabelas oficiais usadas no Módulo 9 e nos scores v11
+# ------------------------------------------------------------
+
+class WeatherObs(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    lat: float
+    lon: float
+
+    fonte: Optional[str] = None
+
+    temperatura: Optional[float] = None
+    umidade: Optional[float] = None
+    ponto_orvalho: Optional[float] = None
+    pressao: Optional[float] = None
+
+    vento_m_s: Optional[float] = None
+    vento_dir: Optional[float] = None
+    rajadas: Optional[float] = None
+    chuva_mm: Optional[float] = None
+
+    rad_solar: Optional[float] = None
+    rad_direta: Optional[float] = None
+    solo_temp_0cm: Optional[float] = None
+    solo_umid_0_1cm: Optional[float] = None
+    evapotranspiracao: Optional[float] = None
+
+    pm10: Optional[float] = None
+    pm25: Optional[float] = None
+    o3: Optional[float] = None
+    no2: Optional[float] = None
+    so2: Optional[float] = None
+    co: Optional[float] = None
+    uv: Optional[float] = None
+
+    observed_at: datetime = Field(default_factory=datetime.utcnow)
+    raw_json: Optional[str] = None
+
+
+class FireObs(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    lat: float
+    lon: float
+    dist_km: Optional[float] = None
+    municipio: Optional[str] = None
+    uf: Optional[str] = None
+    frp: Optional[float] = None
+    datahora: Optional[str] = None
+    fonte: Optional[str] = None
+    observed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AlertScore(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    alert_id: str
+    level: int
+    score: float
+    params_json: str
+    obs_json: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ------------------------------------------------------------
+# Função para criar tabelas (executada na inicialização)
+# ------------------------------------------------------------
+def init_sqlite():
+    print("🔧 Criando tabelas SQLite (WeatherObs / FireObs / AlertScore)...")
+    SQLModel.metadata.create_all(engine)
+    print("✔ SQLite OK")
+
+init_sqlite()
 
 
 # ============================================================
@@ -2835,6 +2917,15 @@ def admin_clear_cache():
 
     return {"ok": True, "cleared": cleared}
 
+
+@router_admin.post("/rebuild_db", summary="Recria todas as tabelas SQLite (cuidado!)")
+def rebuild_db():
+    try:
+        SQLModel.metadata.drop_all(engine)
+        SQLModel.metadata.create_all(engine)
+        return {"ok": True, "msg": "Tabelas recriadas com sucesso."}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ------------------------------------------------------------
 # Registrar router
