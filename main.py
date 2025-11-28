@@ -31,13 +31,6 @@ import pandas as pd
 import joblib
 import numpy as np
 
-# ============================================================
-# Banco de Dados — Mantido por compatibilidade
-# ============================================================
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
-engine = create_engine(DB_URL, pool_pre_ping=True)
 
 # ============================================================
 # Banco de Dados — Mantido por compatibilidade
@@ -47,16 +40,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
-# ============================================================
-# Inicialização ÚNICA das tabelas
-# ============================================================
-
-def init_db():
-    print("🔧 Criando tabelas SQLite...")
-    SQLModel.metadata.create_all(engine)
-    print("✔ Tabelas prontas.")
-
-init_db()
 
 # ============================================================
 # Constantes globais e chaves de APIs
@@ -791,11 +774,20 @@ app.add_middleware(
 
 print("Configuração do AmazonSafe API carregada com sucesso.")
 
+# ============================================================
+# 🔧 Inicialização obrigatória do SQLite (criação das tabelas)
+# ============================================================
+try:
+    print("🔧 Inicializando tabelas SQLite...")
+    SQLModel.metadata.create_all(engine)
+    print("✔ Banco inicializado (tabelas OK).")
+except Exception as e:
+    print("❌ ERRO ao criar tabelas SQLite:", e)
+
 
 # ------------------------------------------------------------
 # HEALTHCHECK / ROOT
 # ------------------------------------------------------------
-
 @app.get("/", summary="Health Check", tags=["Infra"])
 def root():
     return {
@@ -1332,13 +1324,6 @@ class RiskLog(SQLModel, table=True):
     created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
     payload_json: Optional[str] = None
 
-
-def init_db_ai():
-    SQLModel.metadata.create_all(engine)
-    print("✔ [M8] Tabelas de IA criadas (RiskLog).")
-
-
-init_db_ai()
 
 
 # ------------------------------------------------------------
