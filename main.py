@@ -277,7 +277,7 @@ def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
 # HEALTH CHECK — geocode
 # ============================================================
 
-@router_system.get("/health/geocode")
+@router_health.get("/health/geocode")
 def system_geocode_test(city: str = "Belém"):
     try:
         geo = geocode_city(city)
