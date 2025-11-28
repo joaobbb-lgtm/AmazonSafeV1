@@ -1731,12 +1731,14 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
 
        # --- ML ---
     ml_val = ctx.get("ml_raw")
+    
     try:
         ml_raw = float(ml_val) if ml_val is not None else 0.0
-    except:
+    except Exception:
         ml_raw = 0.0
     
     ml_norm = _clip01(ml_raw)
+
 
 
     # --- Alertas ---
@@ -1869,6 +1871,47 @@ try:
     print("✔ Banco inicializado (tabelas OK).")
 except Exception as e:
     print("❌ ERRO ao criar tabelas SQLite:", e)
+
+
+# ====================================================================
+# FUNÇÃO NECESSÁRIA — focos_por_raios_backend (versão mínima v11)
+# ====================================================================
+
+def focos_por_raios_backend(lat: float, lon: float) -> dict:
+    """
+    Versão mínima: usa a função existente inpe_focos_near()
+    e devolve o mesmo formato esperado pelo dashboard v11.
+    """
+
+    try:
+        d50  = inpe_focos_near(lat, lon, 50)
+        d150 = inpe_focos_near(lat, lon, 150)
+        d300 = inpe_focos_near(lat, lon, 300)
+
+        # count seguros mesmo sem features
+        c50  = (d50.get("features")  or {}).get("count", 0)
+        c150 = (d150.get("features") or {}).get("count", 0)
+        c300 = (d300.get("features") or {}).get("count", 0)
+
+        return {
+            "50km": c50,
+            "150km": c150,
+            "300km": c300,
+            "raw": {
+                "50km": d50,
+                "150km": d150,
+                "300km": d300,
+            },
+        }
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "50km": 0,
+            "150km": 0,
+            "300km": 0,
+        }
+
 # ============================================================
 # 🧩 MÓDULO 10 — COLETORES OTIMIZADOS PARA O DASHBOARD (v11)
 # ============================================================
@@ -1888,45 +1931,6 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
-
-# ------------------------------------------------------------
-# 10.0 — focos_por_raios_backend (NOVO — substitui o antigo)
-# ------------------------------------------------------------
-def focos_por_raios_backend(lat: float, lon: float) -> Dict[str, int]:
-    """
-    Nova versão mínima v11:
-    usa inpe_focos_near() e separa os focos por raio.
-    """
-    try:
-        geo = inpe_focos_near(lat, lon, 300)  # busca até 300 km
-        feats = geo.get("features", {}).get("data", [])
-    except Exception:
-        return {"focos_50km": 0, "focos_150km": 0, "focos_300km": 0}
-
-    f50 = f150 = f300 = 0
-
-    for f in feats:
-        props = f.get("properties", {})
-        flat = props.get("latitude")
-        flon = props.get("longitude")
-
-        if flat is None or flon is None:
-            continue
-
-        d = _haversine_km(lat, lon, flat, flon)
-
-        if d <= 50:
-            f50 += 1
-        if d <= 150:
-            f150 += 1
-        if d <= 300:
-            f300 += 1
-
-    return {
-        "focos_50km": f50,
-        "focos_150km": f150,
-        "focos_300km": f300,
-    }
 
 
 # ------------------------------------------------------------
