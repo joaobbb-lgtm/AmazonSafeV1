@@ -2153,12 +2153,14 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
 # 9.6 — ENDPOINT OFICIAL /api/score_final
 # ============================================================
 
+class RiskRequest(BaseModel):
+    cidade: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    raio_km: int = 150   # 🔥 obrigatório
+
 @app.post("/api/score_final", tags=["IA"], summary="Score híbrido (ML + heurística + MAD + alertas)")
 def api_score_final(body: RiskRequest):
-    """
-    Usa o build_observation_context do Módulo 7, 
-    aplica fusão híbrida e retorna o Score Final.
-    """
 
     ctx = build_observation_context(
         cidade=body.cidade,
@@ -2172,7 +2174,7 @@ def api_score_final(body: RiskRequest):
     ctx["ml_raw"] = ml_res.get("ml_raw")
     ctx["ml_level"] = ml_res.get("ml_level")
 
-    # Score final
+    # Score final híbrido
     final = compute_final_score(ctx)
 
     return {
@@ -2183,6 +2185,7 @@ def api_score_final(body: RiskRequest):
         "breakdown": final.breakdown,
         "context": ctx,
     }
+
 
 
 # ============================================================
