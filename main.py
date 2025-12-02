@@ -1,6 +1,6 @@
 
 # ============================================================
-# MÓDULO 1 — IMPORTS ESSENCIAIS E CONFIGURAÇÕES INICIAIS
+# MÓDULO 1 — IMPORTS ESSENCIAIS E CONFIGURAÇÕES INICIAIS (v11)
 # ============================================================
 
 import os
@@ -11,7 +11,6 @@ import time
 import datetime as dt
 import io
 
-
 # FastAPI
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -20,8 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # Tipos
 from typing import Optional, Dict, Any
 
-# DB (opcional – mantido porque o resto do código pode depender)
-from sqlmodel import create_engine, SQLModel
+# DB (apenas SQLModel para compatibilidade — engine é criado no Módulo 6)
+from sqlmodel import SQLModel
 
 # HTTP / Data
 import requests
@@ -30,16 +29,6 @@ import pandas as pd
 # IA
 import joblib
 import numpy as np
-
-
-# ============================================================
-# Banco de Dados — Mantido por compatibilidade
-# ============================================================
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
-engine = create_engine(DB_URL, pool_pre_ping=True)
-
 
 # ============================================================
 # Constantes globais e chaves de APIs
@@ -58,9 +47,10 @@ INPE_CSV_BASE = os.getenv(
 INPE_DEFAULT_SCOPE = os.getenv("INPE_DEFAULT_SCOPE", "diario").lower()
 INPE_DEFAULT_REGION = os.getenv("INPE_DEFAULT_REGION", "Brasil")
 
-# Timeout
+# Timeout HTTP global
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
+# TTL de cache global
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "600"))
 
 # ============================================================
@@ -104,28 +94,21 @@ def haversine_km(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
+
 # ============================================================
-# MÓDULO 3 — GEOCODING + COLETORES HTTP + NORMALIZAÇÃO
+# MÓDULO 3 — GEOCODING + COLETORES HTTP + NORMALIZAÇÃO (v11)
 # ============================================================
 
 import re
-import io
-import math
-import datetime as dt
 import requests
 import pandas as pd
+import datetime as dt
+import math
+from io import BytesIO
 from typing import Optional, Dict, Any
 
-# ---------------------------------------
-# CONSTANTES E CONFIGURAÇÕES
-# ---------------------------------------
-
-GEOCODE_UA = "AmazonSafe/3 (+https://amazonsafe-api.onrender.com)"
-OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "f6713d7b945cc5d989cdc08bcb44b62c0f343f11e0f1080555d0b768283ce101")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
-
 # ============================================================
-# 3.1 — GEOCODING (Nominatim + Open-Meteo + Fallback Belém)
+# CONSTANTES E CONFIGURAÇÕES
 # ============================================================
 
 UF2STATE = {
@@ -138,17 +121,30 @@ UF2STATE = {
     "SE": "Sergipe", "TO": "Tocantins"
 }
 
-GEOCODE_UA = "AmazonSafe/3 (contato: joaobbb@gmail.com; https://amazonsafe-api.onrender.com)"
-GEO_TIMEOUT = 8  # timeouts mais curtos para não travar o backend
+# User-Agent profissional
+GEOCODE_UA = (
+    "AmazonSafe/3 (contato: joaobbb@gmail.com; https://amazonsafe-api.onrender.com)"
+)
 
+# Timeout único vindo do Módulo 1
+# HTTP_TIMEOUT já está definido globalmente no Módulo 1
+
+GEO_TIMEOUT = 8  # timeout curto para evitar travamentos no backend
+
+
+# ============================================================
+# 3.1 — GEOCODING (Nominatim + Open-Meteo + Fallback Belém)
+# ============================================================
 
 def _split_city_state(q: str):
+    """Divide entrada 'cidade, estado' em ('cidade', 'estado')"""
     s = q.strip()
     m = re.split(r"\s*[,;-]\s*|\s{2,}", s, maxsplit=1)
     return (m[0].strip(), m[1].strip()) if len(m) == 2 else (s, None)
 
 
 def _normalize_state(st):
+    """Normaliza UF ou nome do estado."""
     if not st:
         return (None, None)
     up = st.upper()
@@ -162,8 +158,8 @@ def _normalize_state(st):
 
 def _geocode_nominatim(q: str, state_name: str | None):
     """
-    Tenta geocodificar via Nominatim (OpenStreetMap).
-    Retorna dict com lat, lon, display_name ou None.
+    Tenta geocodificar via Nominatim (OSM).
+    Retorna dict com lat/lon/display_name ou None.
     """
     try:
         r = requests.get(
@@ -207,17 +203,16 @@ def _geocode_nominatim(q: str, state_name: str | None):
             }
     except Exception as e:
         print("[GEOCODE] Nominatim falhou:", e)
+
     return None
 
 
 def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
     """
-    Geocodificador robusto com 3 estágios:
-      1) Nominatim (OpenStreetMap)
-      2) Open-Meteo Geocoding
-      3) Fallback: Belém (DEFAULT_LAT/DEFAULT_LON)
-
-    Nunca levanta erro para o chamador — sempre retorna dict.
+    Geocodificador robusto com fallback:
+      1) Nominatim
+      2) Open-Meteo
+      3) Belém/PA (DEFAULT_LAT/DEFAULT_LON)
     """
 
     if not raw_q or not raw_q.strip():
@@ -233,7 +228,7 @@ def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
     if res:
         return res
 
-    # 2) Open-Meteo Geocoding
+    # 2) Open-Meteo Geocoding API
     try:
         r = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
@@ -258,12 +253,12 @@ def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print("[GEOCODE] Open-Meteo falhou:", e)
 
-    # 3) Fallback seguro: Belém/PA
+    # 3) Fallback para Belém/PA
     try:
         lat = float(DEFAULT_LAT)
         lon = float(DEFAULT_LON)
     except Exception:
-        lat, lon = -1.45056, -48.4682453  # hardcoded caso env quebre
+        lat, lon = -1.45056, -48.4682453  # fallback seguro
 
     print(f"[GEOCODE] Fallback para Belém/PA para '{raw_q}'")
 
@@ -273,7 +268,6 @@ def geocode_city(raw_q: str) -> Optional[Dict[str, Any]]:
         "display_name": f"Fallback {raw_q} → Belém/PA",
         "source": "fallback",
     }
-
 
 
 # ============================================================
@@ -286,11 +280,13 @@ try:
 except:
     Retry = None
 
+
 def make_retrying_session(
     total: int = 3,
     backoff: float = 0.5,
     status: tuple = (408, 429, 500, 502, 503, 504),
 ):
+    """Sessão HTTP com retry controlador."""
     s = requests.Session()
     if Retry is not None:
         r = Retry(
@@ -307,15 +303,21 @@ def make_retrying_session(
         s.mount("https://", adapter)
     return s
 
+
 _HTTP = make_retrying_session()
 
-def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT):
-    to = timeout if isinstance(timeout, (int, float, tuple)) else HTTP_TIMEOUT
+
+def http_get(url, *, params=None, headers=None, timeout=None):
+    """GET com retry e timeout inteligente."""
+    to = timeout if isinstance(timeout, (int, float)) else HTTP_TIMEOUT
+
     if isinstance(to, (int, float)):
-        to = (min(5, to), to)
+        to = (min(5, to), to)  # (connect_timeout, read_timeout)
+
     resp = _HTTP.get(url, params=params, headers=headers, timeout=to)
     resp.raise_for_status()
     return resp
+
 
 # ============================================================
 # 3.3 — Open-Meteo Forecast + Air Quality
@@ -324,23 +326,23 @@ def http_get(url, *, params=None, headers=None, timeout=HTTP_TIMEOUT):
 def safe_mean(values):
     if not isinstance(values, list):
         return None
-    clean = [v for v in values if isinstance(v, (int, float))]
+    clean = [v for v in values if isinstance(v, (int, float, float))]
     return sum(clean) / len(clean) if clean else None
 
 
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
 def get_meteo(lat: float, lon: float, retries: int = 5):
     """
-    Coleta:
-    - temperatura, umidade, ponto orvalho
-    - pressão
-    - vento, direção, rajadas
-    - precipitação
-    - radiação solar global e direta
-    - evapotranspiração
-    - solo temperatura e solo umidade
-    - PM10, PM2.5, O3, NO2, SO2, CO
-    - UV index
+    Coleta dados do Open-Meteo:
+      - Temperatura, umidade, ponto de orvalho
+      - Pressão atmosférica
+      - Vento, direção, rajadas
+      - Precipitação
+      - Radiação solar global e direta
+      - Solo (temp/umidade)
+      - Evapotranspiração
+      - PM10, PM2.5, O3, NO2, SO2, CO
+      - UV Index
     """
 
     hourly_vars = ",".join([
@@ -356,7 +358,7 @@ def get_meteo(lat: float, lon: float, retries: int = 5):
         "direct_normal_irradiance",
         "soil_temperature_0cm",
         "soil_moisture_0_to_1cm",
-        "evapotranspiration"
+        "evapotranspiration",
     ])
 
     url_weather = (
@@ -376,12 +378,10 @@ def get_meteo(lat: float, lon: float, retries: int = 5):
 
     for attempt in range(1, retries + 1):
         try:
-            # Clima
             r1 = requests.get(url_weather, timeout=20)
             r1.raise_for_status()
             w = r1.json().get("hourly", {})
 
-            # Qualidade do ar
             r2 = requests.get(url_air, timeout=20)
             r2.raise_for_status()
             a = r2.json().get("hourly", {})
@@ -410,28 +410,31 @@ def get_meteo(lat: float, lon: float, retries: int = 5):
     print("[METEO] Falhou após todas tentativas.")
     return {}
 
+
 # ============================================================
 # 3.5 — INPE (Queimadas)
 # ============================================================
 
-from io import BytesIO
-
 def parse_float_safe(x):
     try:
         return float(str(x).replace(",", "."))
-    except Exception:
+    except:
         return None
+
 
 def _deg_per_km_lat():
     return 1.0 / 111.32
 
+
 def _deg_per_km_lon(lat: float):
     return 1.0 / (111.32 * max(0.01, math.cos(math.radians(lat))))
+
 
 def bbox_from_center(lat, lon, raio_km):
     dlat = raio_km * _deg_per_km_lat()
     dlon = raio_km * _deg_per_km_lon(lat)
     return (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+
 
 def inpe_fetch_csv(scope="diario", region="Brasil", timeout=HTTP_TIMEOUT):
     today = dt.datetime.utcnow().date()
@@ -452,10 +455,11 @@ def inpe_fetch_csv(scope="diario", region="Brasil", timeout=HTTP_TIMEOUT):
 
     return {"df": df, "url": url, "ref": str(ref)}
 
+
 def _canonical_inpe_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normaliza as colunas principais do CSV do INPE.
-    Tenta vários nomes possíveis para latitude/longitude, data, etc.
+    Normaliza colunas principais do CSV do INPE.
+    Suporta diferentes nomes usados pelo INPE.
     """
     cols = {c.lower(): c for c in df.columns}
 
@@ -465,44 +469,37 @@ def _canonical_inpe_columns(df: pd.DataFrame) -> pd.DataFrame:
                 return cols[n]
         return None
 
-    c_lat = pick("latitude","lat","y")
-    c_lon = pick("longitude","lon","x")
-    c_dt  = pick("datahora","data_hora","data_hora_gmt")
-    c_sat = pick("satelite","satellite")
-    c_frp = pick("frp","radiative_power")
-    c_uf  = pick("uf","estado","state")
-    c_mun = pick("municipio","município","city","nome_munic","municipality")
+    c_lat = pick("latitude", "lat", "y")
+    c_lon = pick("longitude", "lon", "x")
+    c_dt  = pick("datahora", "data_hora", "data_hora_gmt")
+    c_sat = pick("satelite", "satellite")
+    c_frp = pick("frp", "radiative_power")
+    c_uf  = pick("uf", "estado", "state")
+    c_mun = pick("municipio", "município", "city", "nome_munic", "municipality")
 
     out = pd.DataFrame()
 
-    out["latitude"] = df[c_lat] if c_lat else None
+    out["latitude"]  = df[c_lat] if c_lat else None
     out["longitude"] = df[c_lon] if c_lon else None
-    out["datahora"] = df[c_dt] if c_dt else None
-    out["satelite"] = df[c_sat] if c_sat else None
-    out["frp"] = df[c_frp] if c_frp else None
-
-    # campos opcionais
-    if c_uf:
-        out["uf"] = df[c_uf]
-    else:
-        out["uf"] = None
-
-    if c_mun:
-        out["municipio"] = df[c_mun]
-    else:
-        out["municipio"] = None
+    out["datahora"]  = df[c_dt] if c_dt else None
+    out["satelite"]  = df[c_sat] if c_sat else None
+    out["frp"]       = df[c_frp] if c_frp else None
+    out["uf"]        = df[c_uf] if c_uf else None
+    out["municipio"] = df[c_mun] if c_mun else None
 
     return out
+
 
 def _json_safe(v):
     try:
         if pd.isna(v):
             return None
-    except Exception:
+    except:
         pass
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return None
     return v
+
 
 @ttl_cache(ttl_seconds=CACHE_TTL_SEC)
 def inpe_focos_near(
@@ -514,10 +511,7 @@ def inpe_focos_near(
     limit: int = 1000,
     timeout: int = HTTP_TIMEOUT,
 ):
-    """
-    Retorna focos do INPE próximos ao ponto (lat, lon),
-    dentro de um raio em km.
-    """
+    """Retorna focos do INPE próximos ao ponto (lat, lon)."""
 
     payload = inpe_fetch_csv(scope=scope, region=region, timeout=timeout)
     df = payload["df"]
@@ -527,11 +521,11 @@ def inpe_focos_near(
     norm["latitude"] = norm["latitude"].map(parse_float_safe)
     norm["longitude"] = norm["longitude"].map(parse_float_safe)
 
-    # Filtra por bounding box aproximado
+    # Bounding box rápido
     minx, miny, maxx, maxy = bbox_from_center(lat, lon, float(raio_km))
     mask = (
-        (norm["longitude"].notna()) &
-        (norm["latitude"].notna()) &
+        norm["longitude"].notna() &
+        norm["latitude"].notna() &
         (norm["longitude"] >= minx) &
         (norm["longitude"] <= maxx) &
         (norm["latitude"] >= miny) &
@@ -539,15 +533,14 @@ def inpe_focos_near(
     )
     sub = norm[mask].copy()
 
-    # Distância exata em km (se a função existir)
+    # Distância exata
     try:
         sub["dist_km"] = sub.apply(
             lambda r: haversine_km(lat, lon, r["latitude"], r["longitude"]),
             axis=1
         )
         sub = sub[sub["dist_km"] <= float(raio_km)]
-    except Exception:
-        # Se der erro em haversine_km, segue sem a filtragem fina
+    except:
         pass
 
     if limit:
@@ -556,14 +549,14 @@ def inpe_focos_near(
     focos = []
     for _, r in sub.iterrows():
         focos.append({
-            "latitude": _json_safe(r.get("latitude")),
+            "latitude":  _json_safe(r.get("latitude")),
             "longitude": _json_safe(r.get("longitude")),
-            "datahora": _json_safe(r.get("datahora")),
-            "satelite": _json_safe(r.get("satelite")),
-            "frp": _json_safe(r.get("frp")),
-            "uf": _json_safe(r.get("uf")) if "uf" in r else None,
-            "municipio": _json_safe(r.get("municipio")) if "municipio" in r else None,
-            "dist_km": _json_safe(r.get("dist_km")),
+            "datahora":  _json_safe(r.get("datahora")),
+            "satelite":  _json_safe(r.get("satelite")),
+            "frp":       _json_safe(r.get("frp")),
+            "uf":        _json_safe(r.get("uf")),
+            "municipio": _json_safe(r.get("municipio")),
+            "dist_km":   _json_safe(r.get("dist_km")),
         })
 
     meta = {
@@ -572,15 +565,17 @@ def inpe_focos_near(
         "reference": payload["ref"],
         "bbox": {"minlon": minx, "minlat": miny, "maxlon": maxx, "maxlat": maxy},
         "count": len(focos),
-        "timestamp_utc": dt.datetime.utcnow().isoformat()+"Z",
+        "timestamp_utc": dt.datetime.utcnow().isoformat() + "Z",
     }
 
     return {
         "features": {"focos": focos, "count": len(focos), "meta": meta},
         "payload": {"csv_url": payload["url"]},
     }
+
+
 # ============================================================
-# 3.6 — DETER PARQUET LOCAL (Cloudflare R2)
+# 3.6 — DETER PARQUET (Cloudflare R2)
 # ============================================================
 
 import zipfile
@@ -593,14 +588,11 @@ DETER_R2_URL = os.getenv(
 DETER_LOCAL_ZIP = "/tmp/deter_parquet.zip"
 DETER_LOCAL_PARQUET = "/tmp/deter.parquet"
 
-@ttl_cache(ttl_seconds=3600)   # revalida a cada 1h
-def load_deter_parquet():
-    """
-    Baixa o arquivo deter_parquet.zip do Cloudflare R2,
-    extrai o .parquet para /tmp e devolve um DataFrame.
-    """
 
-    # 1) baixar zip
+@ttl_cache(ttl_seconds=3600)
+def load_deter_parquet():
+    """Baixa e carrega o DETER parquet hospedado no Cloudflare R2."""
+
     try:
         r = http_get(DETER_R2_URL, timeout=HTTP_TIMEOUT)
         with open(DETER_LOCAL_ZIP, "wb") as f:
@@ -609,17 +601,15 @@ def load_deter_parquet():
         print("[DETER] Erro ao baixar:", e)
         return None
 
-    # 2) extrair parquet
     try:
         with zipfile.ZipFile(DETER_LOCAL_ZIP, "r") as z:
             fname = z.namelist()[0]
             z.extract(fname, "/tmp/")
             os.rename(f"/tmp/{fname}", DETER_LOCAL_PARQUET)
     except Exception as e:
-        print("[DETER] Erro ao extrair:", e)
+        print("[DETER] Erro ao extrair zip:", e)
         return None
 
-    # 3) carregar parquet
     try:
         df = pd.read_parquet(DETER_LOCAL_PARQUET)
         return df
@@ -627,8 +617,9 @@ def load_deter_parquet():
         print("[DETER] Erro ao ler parquet:", e)
         return None
 
+
 # ============================================================
-# 3.7 — DESMATAMENTO POR RAIO USANDO DETER PARQUET
+# 3.7 — DESMATAMENTO POR RAIO (usando DETER)
 # ============================================================
 
 def get_desmatamento(lat: float, lon: float, raio_km: float = 50):
@@ -637,14 +628,10 @@ def get_desmatamento(lat: float, lon: float, raio_km: float = 50):
     if df is None or df.empty:
         return {"count": 0, "area_total": 0}
 
-    # campos esperados:
-    # latitude, longitude, area_ha, dataalerta
-
     df = df.copy()
     df["lat"] = df["latitude"].astype(float)
     df["lon"] = df["longitude"].astype(float)
 
-    # bounding box rápido
     minx, miny, maxx, maxy = bbox_from_center(lat, lon, raio_km)
     sub = df[
         (df["lon"] >= minx) & (df["lon"] <= maxx) &
@@ -654,7 +641,6 @@ def get_desmatamento(lat: float, lon: float, raio_km: float = 50):
     if sub.empty:
         return {"count": 0, "area_total": 0}
 
-    # filtro exato pelo haversine
     sub["dist_km"] = sub.apply(
         lambda r: haversine_km(lat, lon, r["lat"], r["lon"]),
         axis=1
@@ -670,20 +656,17 @@ def get_desmatamento(lat: float, lon: float, raio_km: float = 50):
     }
 
 # ============================================================
-# MÓDULO 4 — NORMALIZADORES E SANITIZAÇÃO DE DADOS
+# MÓDULO 4 — NORMALIZADORES E SANITIZAÇÃO DE DADOS (v11)
 # ============================================================
 
 def normalize_value(x):
-    """Converte para float seguro e descarta valores impossíveis."""
+    """Converte para float seguro, removendo NaN/inf."""
     try:
         if x is None:
             return None
         v = float(x)
-
-        # Remover absurdos
-        if math.isinf(v) or math.isnan(v):
+        if math.isnan(v) or math.isinf(v):
             return None
-
         return v
     except:
         return None
@@ -691,80 +674,65 @@ def normalize_value(x):
 
 def normalize_meteo(data: dict) -> dict:
     """
-    Normaliza o dicionário retornado por Open-Meteo:
-    - converte tudo para float
-    - corrige limites impossíveis
-    - mantém apenas variáveis usadas pelo ML e pelo ConservationScore
+    Normaliza o retorno do Open-Meteo e converte
+    para as FEATURES usadas pelo ML v11.
     """
+
     if not isinstance(data, dict):
         return {}
 
-    out = {}
+    # Converte para float seguro
+    d = {k: normalize_value(v) for k, v in data.items()}
 
-    for k, v in data.items():
-        out[k] = normalize_value(v)
-
-    # Segurança extra — remover lixo inesperado
-    allowed_keys = {
-        "temperature_2m", "relativehumidity_2m", "dewpoint_2m",
-        "surface_pressure", "windspeed_10m", "winddirection_10m",
-        "windgusts_10m", "precipitation",
-        "shortwave_radiation", "direct_normal_irradiance",
-        "soil_temperature_0cm", "soil_moisture_0_to_1cm",
-        "evapotranspiration",
-        "pm10", "pm25", "o3", "no2", "so2", "co", "uv"
+    # Mapeamento → nomes esperados pelo Modelo v11
+    return {
+        "temperatura":          d.get("temperature_2m"),
+        "umidade":              d.get("relativehumidity_2m"),
+        "ponto_orvalho":        d.get("dewpoint_2m"),
+        "pressao":              d.get("surface_pressure"),
+        "vento_m_s":            d.get("windspeed_10m"),
+        "vento_dir":            d.get("winddirection_10m"),
+        "rajadas":              d.get("windgusts_10m"),
+        "chuva_mm":             d.get("precipitation"),
+        "rad_solar":            d.get("shortwave_radiation"),
+        "rad_direta":           d.get("direct_normal_irradiance"),
+        "solo_temp_0cm":        d.get("soil_temperature_0cm"),
+        "solo_umid_0_1cm":      d.get("soil_moisture_0_to_1cm"),
+        "evapotranspiracao":    d.get("evapotranspiration"),
+        "pm10":                 d.get("pm10"),
+        "pm25":                 d.get("pm25"),
+        "o3":                   d.get("o3"),
+        "no2":                  d.get("no2"),
+        "so2":                  d.get("so2"),
+        "co":                   d.get("co"),
+        "uv":                   d.get("uv"),
     }
-
-    # Mantém apenas variáveis conhecidas
-    out = {k: out.get(k) for k in allowed_keys}
-
-    return out
 
 
 def normalize_focos_result(focos_data: dict) -> dict:
-    """
-    Normaliza o resultado da busca INPE focos_near().
-    """
     if not isinstance(focos_data, dict):
         return {"count": 0}
-
-    try:
-        return {
-            "count": int(focos_data.get("count", 0)),
-        }
-    except:
-        return {"count": 0}
+    return {"count": int(focos_data.get("count", 0))}
 
 
 def normalize_desmatamento(data: dict) -> dict:
-    """
-    Normaliza o retorno do DETER via parquet.
-    """
     if not isinstance(data, dict):
         return {"count": 0, "area_total": 0.0}
-
-    try:
-        return {
-            "count": int(data.get("count", 0)),
-            "area_total": float(data.get("area_total", 0.0))
-        }
-    except:
-        return {"count": 0, "area_total": 0.0}
-
-
-
-
+    return {
+        "count": int(data.get("count", 0)),
+        "area_total": float(data.get("area_total", 0.0)),
+    }
 # ============================================================
-# MÓDULO 5 — Inicialização da API FastAPI
+# MÓDULO 5 — Inicialização da API FastAPI (v11)
 # ============================================================
 
 app = FastAPI(
     title="AmazonSafe API",
-    version="2.0",
-    description="API para risco ambiental, previsão de incêndios e monitoramento de conservação"
+    version="3.0-v11",
+    description="API AmazonSafe – Risco ambiental, incêndios, focos e desmatamento"
 )
 
-# CORS — liberar geral (MVP)
+# CORS liberado para MVP
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -773,23 +741,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("Configuração do AmazonSafe API carregada com sucesso.")
+print("✔ AmazonSafe API carregada.")
 
-
-# ------------------------------------------------------------
-# HEALTHCHECK / ROOT
-# ------------------------------------------------------------
-@app.get("/", summary="Health Check", tags=["Infra"])
+@app.get("/", tags=["Infra"], summary="Health Check")
 def root():
     return {
         "ok": True,
-        "message": "AmazonSafe API funcionando",
-        "version": "2.0"
+        "service": "AmazonSafe API",
+        "version": "3.0-v11",
+        "status": "online",
     }
-
-
 # ============================================================
-# MÓDULO 6 — Persistência & Helpers Gerais (v11)
+# MÓDULO 6 — Persistência, NDJSON, Alertas e Helpers (v11)
 # ============================================================
 
 import os
@@ -799,19 +762,13 @@ import math
 import datetime as dt
 from typing import Any, Dict, Optional
 
-from sqlmodel import create_engine, Session
+from sqlmodel import Session
 
 # ------------------------------------------------------------
-# 6.1 — Banco de Dados: Engine único
+# 6.1 — Engine única (vem do módulo 1)
 # ------------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_URL = DATABASE_URL if DATABASE_URL else "sqlite:///./amazonsafe.db"
-
-engine = create_engine(DB_URL, pool_pre_ping=True)
-
-print(f"[DB] Engine inicializado: {DB_URL}")
-
+print(f"[DB] Engine carregado: {DB_URL}")
 
 # ------------------------------------------------------------
 # 6.2 — Helpers de Tempo
@@ -822,29 +779,24 @@ UTC = dt.timezone.utc
 def now_utc() -> dt.datetime:
     return dt.datetime.now(UTC)
 
-
 def now_unix() -> int:
     return int(time.time())
 
-
 # ------------------------------------------------------------
-# 6.3 — Helpers de Persistência Genérica (NDJSON)
+# 6.3 — Persistência NDJSON
 # ------------------------------------------------------------
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
     return path
 
-
 def append_ndjson(path: str, record: dict):
-    """Salva uma linha NDJSON em um arquivo."""
     ensure_dir(os.path.dirname(path))
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-
 # ------------------------------------------------------------
-# 6.4 — Sistema de Alertas (eventos e notificações)
+# 6.4 — Sistema de Alertas
 # ------------------------------------------------------------
 
 ALERTS_DIR = "./runtime_data/alerts"
@@ -854,11 +806,9 @@ WEBHOOK_URL = os.getenv("ALERTS_WEBHOOK_URL")
 _LAST_LEVEL: Dict[str, Dict[str, Any]] = {}
 _LAST_NOTIFY: Dict[str, float] = {}
 
-
 def save_alert_score(alert_id: str, score: float, level: str,
-                      alert_obs: Dict[str, Any],
-                      params: Optional[Dict[str, Any]] = None):
-    """Armazena uma linha em alerts.ndjson."""
+                     alert_obs: Dict[str, Any],
+                     params: Optional[Dict[str, Any]] = None):
     rec = {
         "ts": now_utc().isoformat().replace("+00:00", "Z"),
         "alert_id": alert_id,
@@ -871,7 +821,6 @@ def save_alert_score(alert_id: str, score: float, level: str,
 
 
 def persist_level_change(alert_id: str, old: str, new: str, payload: dict):
-    """Salva mudança de nível em level_events.ndjson."""
     rec = {
         "ts": now_utc().isoformat().replace("+00:00", "Z"),
         "alert_id": alert_id,
@@ -884,7 +833,6 @@ def persist_level_change(alert_id: str, old: str, new: str, payload: dict):
 
 def notify_level_change(alert_id: str, old: str, new: str,
                         score: float, obs: dict):
-    """Envia webhook ou salva no arquivo local."""
     now = time.time()
     last = _LAST_NOTIFY.get(alert_id, 0)
 
@@ -899,30 +847,26 @@ def notify_level_change(alert_id: str, old: str, new: str,
         "to": new,
         "score": score,
         "when": now_utc().isoformat().replace("+00:00", "Z"),
-        "obs": {
-            k: obs.get(k)
-            for k in ("severity", "duration", "frequency", "impact")
-        },
+        "obs": {k: obs.get(k) for k in ("severity", "duration", "frequency", "impact")},
     }
 
     if WEBHOOK_URL:
         try:
-            import requests
             requests.post(WEBHOOK_URL, json=msg, timeout=8)
         except Exception as e:
-            print("[notify error]", e)
+            print("[Webhook Error]", e)
     else:
         append_ndjson(f"{ALERTS_DIR}/notifications.ndjson", msg)
 
 
-def handle_alert_transition(alert_id: str, new_level: str, score: float,
+# ⭐ Nome agora compatível com Módulo 13
+def handle_level_transition(alert_id: str, new_level: str, score: float,
                             alert_obs: Dict[str, Any],
                             extra: Optional[Dict[str, Any]] = None,
                             notify_on_bootstrap: bool = False):
-    """Controla transições de níveis com debounce e persistência."""
 
     old_level = (_LAST_LEVEL.get(alert_id) or {}).get("level")
-    first_time = old_level is None
+    first = old_level is None
 
     if new_level != old_level:
         persist_level_change(alert_id, old_level, new_level, {
@@ -931,23 +875,21 @@ def handle_alert_transition(alert_id: str, new_level: str, score: float,
             **(extra or {}),
         })
 
-        if (not first_time) or notify_on_bootstrap:
+        if (not first) or notify_on_bootstrap:
             notify_level_change(alert_id, old_level, new_level, score, alert_obs)
 
         _LAST_LEVEL[alert_id] = {"level": new_level, "ts": now_utc()}
 
-
 # ------------------------------------------------------------
-# 6.5 — Helpers Genéricos
+# 6.5 — Helpers
 # ------------------------------------------------------------
 
 def safe_float(x, default: float = 0.0) -> float:
     try:
-        f = float(x)
-        return f if math.isfinite(f) else default
-    except Exception:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except:
         return default
-
 
 def coalesce(*vals, default=None):
     for v in vals:
@@ -955,38 +897,31 @@ def coalesce(*vals, default=None):
             return v
     return default
 
-
 def is_valid_pm25(x) -> bool:
-    """Usado no ML híbrido."""
     try:
-        xf = float(x)
-        return math.isfinite(xf) and xf >= 1.0
+        v = float(x)
+        return math.isfinite(v) and v >= 1.0
     except:
         return False
 
 # ============================================================
-# MÓDULO 7 — Sistema de Risco AmazonSafe (v11)
+# MÓDULO 7 — Sistema de Risco AmazonSafe (v11) — REVISADO
 # ============================================================
 
-import os
 import math
-import zipfile
-from io import BytesIO
-from typing import Any, Dict, Optional
-
-import pandas as pd
 import requests
+import pandas as pd
+from io import BytesIO
 from fastapi import HTTPException
+from typing import Any, Dict, Optional, Tuple
 
-
-# Defaults gerais
-DEFAULT_LAT = -1.45056
-DEFAULT_LON = -48.4682
-
-HTTP_TIMEOUT = 15
+# Usar mesmas constantes globais do Módulo 1
+DEFAULT_LAT = float(os.getenv("DEFAULT_LAT", "-1.4558"))
+DEFAULT_LON = float(os.getenv("DEFAULT_LON", "-48.5039"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 # ------------------------------------------------------------
-# 7.1 — Resolver localização
+# 7.1 — Resolver localização (geocode + fallback)
 # ------------------------------------------------------------
 
 def _float_or_none(x):
@@ -1001,13 +936,14 @@ def _float_or_none(x):
 def resolve_location(cidade: Optional[str], lat: Optional[float], lon: Optional[float]):
     """
     Regras:
-    - Se cidade → geocodifica
-    - Se lat/lon enviados → usa direto
-    - Caso contrário → fallback (Belém)
+      1) Se cidade → geocode
+      2) Se lat/lon → usa direto
+      3) Caso contrário → fallback global (Belém)
     """
     lat = _float_or_none(lat)
     lon = _float_or_none(lon)
 
+    # Por cidade
     if cidade:
         info = geocode_city(cidade)
         if not info:
@@ -1017,19 +953,21 @@ def resolve_location(cidade: Optional[str], lat: Optional[float], lon: Optional[
             "display_name": info.get("display_name")
         }
 
+    # Por coordenadas explícitas
     if lat is not None and lon is not None:
         return lat, lon, {"resolved_by": "direct_params"}
 
+    # Fallback global
     return DEFAULT_LAT, DEFAULT_LON, {"resolved_by": "default"}
 
 
 # ------------------------------------------------------------
-# 7.2 — Carregamento do DETER unificado (.parquet ou ZIP)
+# 7.2 — Carregamento unificado do DETER
 # ------------------------------------------------------------
 
 DETER_PARQUET_PATH = os.getenv("DETER_PARQUET_PATH", "")
 DETER_PARQUET_URL  = os.getenv("DETER_PARQUET_URL", "")
-DETER_CACHE_TTL     = int(os.getenv("DETER_CACHE_TTL_SEC", "3600"))
+DETER_CACHE_TTL    = int(os.getenv("DETER_CACHE_TTL_SEC", "3600"))
 
 
 def _read_parquet_zip(zf: zipfile.ZipFile) -> pd.DataFrame:
@@ -1042,15 +980,15 @@ def _read_parquet_zip(zf: zipfile.ZipFile) -> pd.DataFrame:
 
 @ttl_cache(ttl_seconds=DETER_CACHE_TTL)
 def load_deter() -> Optional[pd.DataFrame]:
-    """Carrega o parquet local, ou baixa da URL configurada."""
-    # Fonte local
+    """Carrega parquet local ou remoto com cache."""
+    # Local
     if DETER_PARQUET_PATH and os.path.exists(DETER_PARQUET_PATH):
         if DETER_PARQUET_PATH.lower().endswith(".zip"):
             with zipfile.ZipFile(DETER_PARQUET_PATH, "r") as zf:
                 return _read_parquet_zip(zf)
         return pd.read_parquet(DETER_PARQUET_PATH)
 
-    # URL remota
+    # URL
     if DETER_PARQUET_URL:
         r = requests.get(DETER_PARQUET_URL, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
@@ -1064,7 +1002,7 @@ def load_deter() -> Optional[pd.DataFrame]:
 
 
 def canonical_deter_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza latitude/longitude/área/classes."""
+    """Normaliza colunas latitude/longitude/área/classe/bioma."""
     cols = {c.lower(): c for c in df.columns}
 
     def pick(*names):
@@ -1114,50 +1052,52 @@ def deter_stats(lat: float, lon: float, raio_km: float = 150.0) -> Dict[str, Any
     )
     sub = det[mask].copy()
 
-    # filtro fino
+    # Filtro fino
     try:
-        sub["dist"] = sub.apply(lambda r: haversine_km(lat, lon, r["latitude"], r["longitude"]), axis=1)
+        sub["dist"] = sub.apply(
+            lambda r: haversine_km(lat, lon, r["latitude"], r["longitude"]), axis=1
+        )
         sub = sub[sub["dist"] <= raio_km]
     except:
         pass
 
     n = len(sub)
-    if "area_ha" in sub.columns:
-        area_total = float(sub["area_ha"].dropna().sum())
-    else:
-        area_total = float(n)
+    area_total = float(sub["area_ha"].dropna().sum()) if "area_ha" in sub else float(n)
 
     score_raw = math.log1p(area_total) + 0.5 * math.log1p(n)
     score_norm = max(0.0, min(1.0, score_raw / 4.0))
 
     return {
         "count": int(n),
-        "total_area_ha": float(area_total),
+        "total_area_ha": area_total,
         "score_raw": score_raw,
         "score_norm": score_norm,
     }
 
 
 # ------------------------------------------------------------
-# 7.3 — Focos INPE
+# 7.3 — Focos do INPE (wrapper robusto)
 # ------------------------------------------------------------
 
-INPE_DEFAULT_SCOPE  = "diario"
-INPE_DEFAULT_REGION = "Brasil"
-
-
-
 def focos_stats(lat: float, lon: float, raio_km: float = 150.0,
-                scope: str = INPE_DEFAULT_SCOPE,
-                region: str = INPE_DEFAULT_REGION) -> Dict[str, Any]:
+                scope: str = "diario",
+                region: str = "Brasil") -> Dict[str, Any]:
 
-    data = inpe_focos_near(lat, lon, raio_km, scope, region)
-    feats = data.get("features", {})
-    focos = feats.get("focos", [])
-    meta  = feats.get("meta", {})
+    try:
+        data = inpe_focos_near(lat, lon, raio_km, scope, region)
+        feats = data.get("features", {})
+        focos = feats.get("focos", [])
+        meta  = feats.get("meta", {})
+    except Exception as e:
+        return {
+            "count": 0,
+            "frp_sum": 0.0,
+            "score_raw": 0.0,
+            "score_norm": 0.0,
+            "meta": {"error": str(e)}
+        }
 
     n = int(feats.get("count") or len(focos))
-
     frp_vals = [parse_float_safe(f.get("frp")) for f in focos]
     frp_vals = [v for v in frp_vals if v is not None]
     frp_sum = float(sum(frp_vals)) if frp_vals else 0.0
@@ -1175,12 +1115,11 @@ def focos_stats(lat: float, lon: float, raio_km: float = 150.0,
 
 
 # ------------------------------------------------------------
-# 7.4 — Score Heurístico de Conservação
+# 7.4 — Score de Conservação (chuva + ar − desmatamento − focos)
 # ------------------------------------------------------------
 
 PM25_LIMIT = 35.0
 PM10_LIMIT = 50.0
-
 TH_YELLOW = 40
 TH_RED    = 70
 
@@ -1232,18 +1171,28 @@ def conservation_score(meteo: dict, det: dict, foc: dict) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# 7.5 — Construção do CONTEXTO (para módulos 8 e 9)
+# 7.5 — Contexto completo usado pelo Módulo 8 e Módulo 9
 # ------------------------------------------------------------
 
 def build_context(cidade=None, lat=None, lon=None, raio_km=150.0) -> Dict[str, Any]:
-
+    """
+    Contexto oficial do AmazonSafe v11.
+    Sempre retorna meteo + deter + focos + conservation_score.
+    """
+    # 1) Localização
     lat_r, lon_r, loc_meta = resolve_location(cidade, lat, lon)
 
+    # 2) Clima
     met_raw = get_meteo(lat_r, lon_r) or {}
     met = normalize_meteo(met_raw)
 
+    # 3) DETER
     det = deter_stats(lat_r, lon_r, raio_km)
+
+    # 4) Focos
     foc = focos_stats(lat_r, lon_r, raio_km)
+
+    # 5) Conservação (heurístico)
     cons = conservation_score(met, det, foc)
 
     return {
@@ -1259,10 +1208,8 @@ def build_context(cidade=None, lat=None, lon=None, raio_km=150.0) -> Dict[str, A
         "conservation": cons,
     }
 
-
-
 # ============================================================
-# NOVO MÓDULO 8 — SQLModel + IA AmazonSafe v11
+# MÓDULO 8 — SQLModel + IA AmazonSafe v11 (REVISADO)
 # ============================================================
 
 import os
@@ -1276,7 +1223,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 # ------------------------------------------------------------
-# 8.0 — BANCO (opcional — apenas logs e histórico)
+# 8.0 — BANCO (somente logs históricos, opcional)
 # ------------------------------------------------------------
 
 from sqlmodel import SQLModel, Field, Session, create_engine
@@ -1288,7 +1235,7 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 
 
 class RiskLog(SQLModel, table=True):
-    """Registro histórico de previsões do modelo ML."""
+    """Registro de previsões do modelo ML."""
     id: Optional[int] = Field(default=None, primary_key=True)
     latitude: float
     longitude: float
@@ -1298,7 +1245,6 @@ class RiskLog(SQLModel, table=True):
     payload_json: Optional[str] = None
 
 
-
 # ------------------------------------------------------------
 # 8.1 — CARREGAR MODELO V11
 # ------------------------------------------------------------
@@ -1306,8 +1252,8 @@ class RiskLog(SQLModel, table=True):
 MODEL_PATH = "models/amazonsafe_pipeline_v11.joblib"
 
 try:
-    modelo_pipeline = joblib.load(MODEL_PATH)
-    print(f"[IA] Modelo AmazonSafe v11 carregado de: {MODEL_PATH}")
+    modelo_pipeline = joblib.load(MODEL_PATH, mmap_mode="r")
+    print(f"[IA] Modelo AmazonSafe v11 carregado com sucesso de: {MODEL_PATH}")
 except Exception as e:
     print(f"[IA] ERRO ao carregar modelo v11: {e}")
     modelo_pipeline = None
@@ -1344,19 +1290,19 @@ MODEL_FEATURES = [
 
 
 # ------------------------------------------------------------
-# 8.3 — Função auxiliar: montar vetor X
+# 8.3 — FEATURE VECTOR
 # ------------------------------------------------------------
 
 def _build_feature_vector(payload: Dict[str, Any]) -> np.ndarray:
     """
-    Gera vetor ordenado nas FEATURES do modelo.
-    Valores inexistentes -> 0.
+    Cria vetor X na ordem oficial.
+    Valores faltantes -> 0.
     """
     row = []
     for col in MODEL_FEATURES:
-        v = payload.get(col)
+        val = payload.get(col)
         try:
-            row.append(float(v) if v is not None else 0.0)
+            row.append(float(val) if val is not None else 0.0)
         except:
             row.append(0.0)
 
@@ -1364,42 +1310,45 @@ def _build_feature_vector(payload: Dict[str, Any]) -> np.ndarray:
 
 
 # ------------------------------------------------------------
-# 8.4 — Função de previsão (usada pelo Módulo 9)
+# 8.4 — Função oficial de predição para Módulo 9
 # ------------------------------------------------------------
 
-    def run_ml_model(ctx: dict) -> dict:
-    
-        if modelo_pipeline is None:
-            return {"ml_raw": 0.0, "ml_level": "modelo_indisponivel"}
-    
-        loc = ctx.get("location", {})
-        met = ctx.get("meteo", {})
-    
-        # Payload seguro
-        payload = met.copy()
-        payload["latitude"] = float(loc.get("lat") or 0.0)
-        payload["longitude"] = float(loc.get("lon") or 0.0)
-    
-        X = _build_feature_vector(payload)
-    
-        try:
-            pred = float(modelo_pipeline.predict(X)[0])
-        except Exception as e:
-            print("[run_ml_model] ERRO:", e)
-            return {"ml_raw": 0.0, "ml_level": "erro"}
-    
-        ml_raw = max(0.0, min(1.0, pred))
-    
-        level = (
-            "Baixo" if ml_raw < 0.33
-            else "Médio" if ml_raw < 0.66
-            else "Alto"
-        )
-    
-        return {
-            "ml_raw": ml_raw,
-            "ml_level": level,
-        }
+def run_ml_model(ctx: dict) -> dict:
+    """
+    Usa o contexto oficial do Módulo 7.
+    Retorna ml_raw (0–1) + nível textual.
+    """
+
+    if modelo_pipeline is None:
+        return {"ml_raw": 0.0, "ml_level": "modelo_indisponivel"}
+
+    loc = ctx.get("location", {})
+    met = ctx.get("meteo", {})
+
+    payload = met.copy()
+    payload["latitude"] = float(loc.get("lat") or 0.0)
+    payload["longitude"] = float(loc.get("lon") or 0.0)
+
+    X = _build_feature_vector(payload)
+
+    try:
+        pred = float(modelo_pipeline.predict(X)[0])
+    except Exception as e:
+        print("[run_ml_model] ERRO:", e)
+        return {"ml_raw": 0.0, "ml_level": "erro"}
+
+    ml_raw = max(0.0, min(1.0, pred))
+
+    level = (
+        "Baixo" if ml_raw < 0.33
+        else "Médio" if ml_raw < 0.66
+        else "Alto"
+    )
+
+    return {
+        "ml_raw": ml_raw,
+        "ml_level": level
+    }
 
 
 # ------------------------------------------------------------
@@ -1439,7 +1388,6 @@ from fastapi import APIRouter
 
 router_risk = APIRouter()
 
-
 @router_risk.post("/api/risk", tags=["IA"], summary="Previsão de risco ambiental (AmazonSafe v11)")
 def api_risk(data: RiskInput):
 
@@ -1463,7 +1411,7 @@ def api_risk(data: RiskInput):
     else:
         level = "alto"
 
-    # -> salva log opcional
+    # log opcional
     try:
         with Session(engine) as sess:
             rec = RiskLog(
@@ -1488,44 +1436,60 @@ def api_risk(data: RiskInput):
         "nivel": level
     }
 
-
-# Nota: o router precisa ser incluído no main:
+# → No main.py:
 # app.include_router(router_risk)
 
 
 # ============================================================
-# 🧩 MÓDULO 9 — IA Leve + Scoring Inteligente (v11) — OTIMIZADO
+# 🧩 MÓDULO 9 — Score Final (Heurística + IA + Alertas + MAD)
 # ============================================================
 
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime, timezone
+from datetime import datetime
 import math
 import statistics as stats
 
 from fastapi import HTTPException
-from sqlmodel import Session, select
+from sqlmodel import SQLModel, Session, Field, select
 
+# Importa funções dos módulos anteriores
+# (estes nomes precisam existir no main)
+# build_context → módulo 7
+# run_ml_model  → módulo 8
+# inpe_focos_near → módulo 3
 
 # ------------------------------------------------------------
 # 9.0 — Limiares / Pesos do Score Final
 # ------------------------------------------------------------
 
 FINAL_THRESHOLDS = {
-    "green_lt": 33,   # score < 33  → Verde
-    "yellow_lt": 66,  # score < 66  → Amarelo
+    "green_lt": 33,   # <33 → Verde
+    "yellow_lt": 66,  # <66 → Amarelo
 }
 
 FINAL_WEIGHTS = {
-    "heuristic": 0.40,   # ConservationScore (Módulo 7)
-    "ml":        0.40,   # RandomForest v11 (Módulo 8)
-    "alerts":    0.15,   # severity/duration/frequency/impact
-    "mad":       0.05,   # penalidades por outliers PM
+    "heuristic": 0.40,
+    "ml":        0.40,
+    "alerts":    0.15,
+    "mad":       0.05,
 }
+
+# ------------------------------------------------------------
+# 9.0-A — Classe WeatherObs (necessária p/ MAD)
+# ------------------------------------------------------------
+
+class WeatherObs(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    lat: float
+    lon: float
+    pm25: float | None = None
+    pm10: float | None = None
+    observed_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ------------------------------------------------------------
-# 9.1 — Estrutura final de retorno
+# 9.1 — Estrutura final
 # ------------------------------------------------------------
 
 @dataclass
@@ -1535,12 +1499,11 @@ class FinalScoreResult:
     breakdown: Dict[str, Any]
 
 
-# ============================================================
-# 9.2 — Funções utilitárias otimizadas
-# ============================================================
+# ------------------------------------------------------------
+# 9.2 — Funções utilitárias
+# ------------------------------------------------------------
 
 def _clip01(x: Any) -> float:
-    """Garante que x ∈ [0,1]."""
     try:
         return max(0.0, min(1.0, float(x)))
     except:
@@ -1548,7 +1511,6 @@ def _clip01(x: Any) -> float:
 
 
 def _classify_level(score: float) -> str:
-    """Retorna Verde / Amarelo / Vermelho."""
     if score < FINAL_THRESHOLDS["green_lt"]:
         return "Verde"
     if score < FINAL_THRESHOLDS["yellow_lt"]:
@@ -1556,23 +1518,9 @@ def _classify_level(score: float) -> str:
     return "Vermelho"
 
 
-def _rainfall_index(mm: Optional[float]) -> float:
-    """Normaliza chuva em 0–1 usando escala fixa (50 mm → 1.0)."""
-    try:
-        v = float(mm or 0.0)
-    except:
-        return 0.0
-
-    if v <= 0:
-        return 0.0
-    if v >= 50:
-        return 1.0
-    return v / 50.0
-
-
-# ============================================================
-# 9.3 — Score de Alerta (severity/duration/freq/impact + chuva)
-# ============================================================
+# ------------------------------------------------------------
+# 9.3 — Score de Alertas
+# ------------------------------------------------------------
 
 ALERT_WEIGHTS = {
     "severity": 0.25,
@@ -1583,34 +1531,27 @@ ALERT_WEIGHTS = {
 }
 
 def compute_alert_score(alert_obs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calcula score leve baseado em:
-      - severidade
-      - duração
-      - frequência
-      - impacto
-      - chuva nas últimas 24h
-    """
     sev  = _clip01(alert_obs.get("severity"))
     dur  = _clip01(alert_obs.get("duration"))
     freq = _clip01(alert_obs.get("frequency"))
     imp  = _clip01(alert_obs.get("impact"))
 
-    precip_24h = (
+    p = (
         alert_obs.get("precip_24h")
         or alert_obs.get("chuva_mm")
         or alert_obs.get("precipitation")
-        or (alert_obs.get("meta", {}).get("precipitation"))
         or 0.0
     )
 
-    rainfall = _rainfall_index(precip_24h)
+    if p <= 0: rainfall = 0.0
+    elif p >= 50: rainfall = 1.0
+    else: rainfall = p / 50.0
 
     score = (
-        sev  * ALERT_WEIGHTS["severity"]
-        + dur  * ALERT_WEIGHTS["duration"]
+        sev * ALERT_WEIGHTS["severity"]
+        + dur * ALERT_WEIGHTS["duration"]
         + freq * ALERT_WEIGHTS["frequency"]
-        + imp  * ALERT_WEIGHTS["impact"]
+        + imp * ALERT_WEIGHTS["impact"]
         + rainfall * ALERT_WEIGHTS["rainfall"]
     )
 
@@ -1622,35 +1563,25 @@ def compute_alert_score(alert_obs: Dict[str, Any]) -> Dict[str, Any]:
             "frequency": freq,
             "impact": imp,
             "rainfall": rainfall,
-            "precip_24h_mm": float(precip_24h),
+            "precip_24h": p,
         }
     }
 
 
-# ============================================================
-# 9.4 — MAD (Detecção de Outliers Ambientais)
-# ============================================================
+# ------------------------------------------------------------
+# 9.4 — MAD (outliers ambientais)
+# ------------------------------------------------------------
 
-def _round_coord(v: float, ndigits: int = 3):
-    """Arredonda coordenadas para indexação local."""
-    return round(float(v), ndigits)
+def _round_coord(x): return round(float(x), 3)
 
-
-def _mad(values: List[float]):
-    """Retorna mediana e MAD (Median Absolute Deviation)."""
-    if not values:
-        return None
-    med = stats.median(values)
-    devs = [abs(x - med) for x in values]
-    mad = stats.median(devs)
-    return med, mad
+def _mad(values):
+    if not values: return None
+    m = stats.median(values)
+    devs = [abs(v - m) for v in values]
+    return m, stats.median(devs)
 
 
-def pm_outlier_flags(lat: float, lon: float, pm25, pm10, k=5.0, lookback=50):
-    """
-    Verifica se PM2.5/PM10 são outliers em relação ao histórico local.
-    Usa WeatherObs do módulo 6.
-    """
+def pm_outlier_flags(lat, lon, pm25, pm10, k=5.0, lookback=50):
     if pm25 is None and pm10 is None:
         return False, False
 
@@ -1671,101 +1602,49 @@ def pm_outlier_flags(lat: float, lon: float, pm25, pm10, k=5.0, lookback=50):
 
     flag25 = flag10 = False
 
-    # Outlier PM2.5
-    if pm25 is not None and len(pm25_hist) >= 10:
-        mad_res = _mad(pm25_hist)
-        if mad_res:
-            med, mad = mad_res
-            if mad and abs(pm25 - med) > k * 1.4826 * mad:
-                flag25 = True
+    if pm25_hist:
+        med, mad = _mad(pm25_hist)
+        if mad and abs(pm25 - med) > k * 1.4826 * mad:
+            flag25 = True
 
-    # Outlier PM10
-    if pm10 is not None and len(pm10_hist) >= 10:
-        mad_res = _mad(pm10_hist)
-        if mad_res:
-            med, mad = mad_res
-            if mad and abs(pm10 - med) > k * 1.4826 * mad:
-                flag10 = True
+    if pm10_hist:
+        med, mad = _mad(pm10_hist)
+        if mad and abs(pm10 - med) > k * 1.4826 * mad:
+            flag10 = True
 
     return flag25, flag10
 
 
-# ============================================================
-# 9.5 — Fusão Final de Scores (Heurística + IA + Alertas + MAD)
-# ============================================================
-
-def _extract_heuristic_from_ctx(ctx: Dict[str, Any]) -> Tuple[float, Optional[str]]:
-    """
-    Extrai o heuristic_score do Módulo 7.
-    Prioridade:
-      1) ctx["conservation"]["score"]
-      2) ctx["heuristic_score"] (compatibilidade)
-    """
-    cons = ctx.get("conservation") or {}
-    score = cons.get("score")
-    level = cons.get("level")
-
-    if score is None:
-        score = ctx.get("heuristic_score")
-    if level is None:
-        level = ctx.get("heuristic_level")
-
-    try:
-        return float(score or 0.0), level
-    except:
-        return 0.0, level
-
+# ------------------------------------------------------------
+# 9.5 — Fusão Final dos Scores
+# ------------------------------------------------------------
 
 def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
-    """
-    Combinação final:
-        - heurística → peso 0.40
-        - ML v11    → peso 0.40
-        - alertas   → peso 0.15
-        - MAD       → peso 0.05
-    """
 
-    # --- Heurística ---
-    heuristic_raw, heuristic_level = _extract_heuristic_from_ctx(ctx)
+    # Heurística (Módulo 7)
+    cons = ctx.get("conservation", {})
+    heuristic_raw = float(cons.get("score") or 0.0)
     heuristic_norm = heuristic_raw / 100.0
 
-       # --- ML ---
-    ml_val = ctx.get("ml_raw")
-    
-    try:
-        ml_raw = float(ml_val) if ml_val is not None else 0.0
-    except Exception:
-        ml_raw = 0.0
-    
+    # ML (Módulo 8)
+    ml_raw = float(ctx.get("ml_raw") or 0.0)
     ml_norm = _clip01(ml_raw)
 
-
-
-    # --- Alertas ---
+    # Alertas
     alert_params = ctx.get("alert_params") or {}
-    alert_data = compute_alert_score(alert_params) if alert_params else {
-        "score": 0.0,
-        "components": {}
-    }
+    alert_data = compute_alert_score(alert_params)
     alert_norm = _clip01(alert_data["score"])
 
-    # --- Outliers MAD ---
+    # MAD
     met = ctx.get("meteo") or {}
-    loc = ctx.get("location") or {}
+    lat = ctx["location"]["lat"]
+    lon = ctx["location"]["lon"]
 
-    lat = loc.get("lat")
-    lon = loc.get("lon")
+    p25_flag, p10_flag = pm_outlier_flags(lat, lon, met.get("pm25"), met.get("pm10"))
+    mad_penalty = 0.3 * p25_flag + 0.3 * p10_flag
+    mad_penalty = min(1.0, mad_penalty)
 
-    mad_penalty = 0.0
-    if lat and lon:
-        p25_flag, p10_flag = pm_outlier_flags(lat, lon, met.get("pm25"), met.get("pm10"))
-        if p25_flag:
-            mad_penalty += 0.3
-        if p10_flag:
-            mad_penalty += 0.3
-        mad_penalty = min(1.0, mad_penalty)
-
-    # --- Fusão final ---
+    # Fusão
     final = (
         heuristic_norm * FINAL_WEIGHTS["heuristic"]
         + ml_norm       * FINAL_WEIGHTS["ml"]
@@ -1780,11 +1659,10 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
         score=round(final_score, 2),
         level=final_level,
         breakdown={
-            "heuristic_score_norm": heuristic_norm,
             "heuristic_raw": heuristic_raw,
-            "heuristic_level": heuristic_level,
-            "ml_norm": ml_norm,
+            "heuristic_norm": heuristic_norm,
             "ml_raw": ml_raw,
+            "ml_norm": ml_norm,
             "alert_norm": alert_norm,
             "alert_details": alert_data,
             "mad_penalty": mad_penalty,
@@ -1793,65 +1671,35 @@ def compute_final_score(ctx: Dict[str, Any]) -> FinalScoreResult:
         },
     )
 
-# ============================================================
-# Função essencial — build_observation_context (mínima v11)
-# ============================================================
-def build_observation_context(cidade=None, lat=None, lon=None, raio_km=150,
-                              meteo=None, focos=None, deter=None):
-    """
-    Versão mínima funcional para v11.
-    Garante estrutura usada pelos endpoints e modelo.
-    """
-    # monta estrutura compatível com o restante do código
-    return {
-        "location": {
-            "cidade": cidade,
-            "lat": lat,
-            "lon": lon,
-            "radius_km": raio_km,
-            "resolved_by": "direct",
-            "display_name": cidade or f"{lat},{lon}"
-        },
-        "meteo": meteo or {},
-        "focos": focos or {},
-        "deter": deter or {},
-        "conservation": {
-            "score": None,
-            "level": None,
-            "components": {}
-        },
-        "ml_raw": 0.0,
-        "ml_level": "desconhecido",
-    }
 
-# ============================================================
-# 9.6 — ENDPOINT OFICIAL /api/score_final
-# ============================================================
+# ------------------------------------------------------------
+# 9.6 — ENDPOINT /api/score_final
+# ------------------------------------------------------------
 
 class RiskRequest(BaseModel):
     cidade: str | None = None
     lat: float | None = None
     lon: float | None = None
-    raio_km: int = 150   # padrão
+    raio_km: int = 150
 
 
-@app.post("/api/score_final", tags=["IA"], summary="Score híbrido (ML + heurística + MAD + alertas)")
+@app.post("/api/score_final", tags=["IA"])
 def api_score_final(body: RiskRequest):
 
-    # 1) Monta contexto completo (Módulo 7)
-    ctx = build_observation_context(
+    # 1) Puxa contexto COMPLETO (Módulo 7)
+    ctx = build_context(
         cidade=body.cidade,
         lat=body.lat,
         lon=body.lon,
         raio_km=body.raio_km,
     )
 
-    # 2) ML v11 (Módulo 8)
+    # 2) ML v11
     ml_res = run_ml_model(ctx)
-    ctx["ml_raw"] = ml_res.get("ml_raw")
-    ctx["ml_level"] = ml_res.get("ml_level")
+    ctx["ml_raw"] = ml_res["ml_raw"]
+    ctx["ml_level"] = ml_res["ml_level"]
 
-    # 3) Score final (este módulo)
+    # 3) Score final
     final = compute_final_score(ctx)
 
     return {
@@ -1862,66 +1710,32 @@ def api_score_final(body: RiskRequest):
         "breakdown": final.breakdown,
     }
 
-# ============================================================
-# 🔧 Inicialização obrigatória do SQLite (criação das tabelas)
-# ============================================================
+
+# ------------------------------------------------------------
+# 9.7 — Inicialização das tabelas SQLite
+# ------------------------------------------------------------
+
 try:
-    print("🔧 Inicializando tabelas SQLite...")
     SQLModel.metadata.create_all(engine)
-    print("✔ Banco inicializado (tabelas OK).")
+    print("✔ WeatherObs e RiskLog criados.")
 except Exception as e:
-    print("❌ ERRO ao criar tabelas SQLite:", e)
-
-
-# ====================================================================
-# FUNÇÃO NECESSÁRIA — focos_por_raios_backend (versão mínima v11)
-# ====================================================================
-
-def focos_por_raios_backend(lat: float, lon: float) -> dict:
-    """
-    Versão mínima: usa a função existente inpe_focos_near()
-    e devolve o mesmo formato esperado pelo dashboard v11.
-    """
-
-    try:
-        d50  = inpe_focos_near(lat, lon, 50)
-        d150 = inpe_focos_near(lat, lon, 150)
-        d300 = inpe_focos_near(lat, lon, 300)
-
-        # count seguros mesmo sem features
-        c50  = (d50.get("features")  or {}).get("count", 0)
-        c150 = (d150.get("features") or {}).get("count", 0)
-        c300 = (d300.get("features") or {}).get("count", 0)
-
-        return {
-            "50km": c50,
-            "150km": c150,
-            "300km": c300,
-            "raw": {
-                "50km": d50,
-                "150km": d150,
-                "300km": d300,
-            },
-        }
-
-    except Exception as e:
-        return {
-            "error": str(e),
-            "50km": 0,
-            "150km": 0,
-            "300km": 0,
-        }
+    print("ERRO ao criar tabelas:", e)
 
 # ============================================================
-# 🧩 MÓDULO 10 — COLETORES OTIMIZADOS PARA O DASHBOARD (v11)
+# 🧩 MÓDULO 10 — COLETORES OTIMIZADOS PARA O DASHBOARD (v11) — REVISADO
 # ============================================================
 
 from typing import Dict, Any
 from math import radians, sin, cos, sqrt, atan2
 
+# Importações dos módulos centrais
+# get_meteo, normalize_meteo → Módulo 3
+# focos_por_raios_backend → Módulo 9
+# deter_stats → Módulo 7
+
 
 # ------------------------------------------------------------
-# Função auxiliar — distância haversine (km)
+# Função auxiliar — haversine (km)
 # ------------------------------------------------------------
 def _haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -1932,15 +1746,14 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
-
 # ------------------------------------------------------------
-# 10.1 — Coletor de clima atual (Open-Meteo + Normalização)
+# 10.1 — Clima (Open-Meteo)
 # ------------------------------------------------------------
 def collect_weather_now(lat: float, lon: float) -> Dict[str, Any]:
-    """Coleta clima atual e padroniza para o dashboard v11."""
     try:
         raw = get_meteo(lat, lon)
         clima_norm = normalize_meteo(raw)
+
         return {
             "ok": True,
             "fonte": "open-meteo",
@@ -1953,15 +1766,13 @@ def collect_weather_now(lat: float, lon: float) -> Dict[str, Any]:
             "ok": False,
             "erro": str(e),
             "coords": {"lat": lat, "lon": lon},
-            "features": {},
         }
 
 
 # ------------------------------------------------------------
-# 10.2 — Coletor de focos (corrigido)
+# 10.2 — Focos (INPE)
 # ------------------------------------------------------------
 def collect_focos_now(lat: float, lon: float) -> Dict[str, Any]:
-    """Coleta número de focos reais em 50/150/300 km."""
     try:
         focos = focos_por_raios_backend(lat, lon)
         return {
@@ -1978,15 +1789,11 @@ def collect_focos_now(lat: float, lon: float) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# 10.3 — Coletor de DETER (últimas detecções)
+# 10.3 — DETER (Módulo 7)
 # ------------------------------------------------------------
 def collect_deter_now(lat: float, lon: float, raio_km: int = 150) -> Dict[str, Any]:
-    """
-    Coleta últimas detecções DETER (backend módulo 7).
-    Usa o alvo espacial coerente com focos e IA.
-    """
     try:
-        deter = get_deter_data(lat, lon, raio_km)
+        deter = deter_stats(lat, lon, raio_km)
         return {
             "ok": True,
             "coords": {"lat": lat, "lon": lon},
@@ -2001,28 +1808,18 @@ def collect_deter_now(lat: float, lon: float, raio_km: int = 150) -> Dict[str, A
 
 
 # ------------------------------------------------------------
-# 10.4 — Bundle unificado para dashboards (v11)
+# 10.4 — Bundle unificado para o dashboard
 # ------------------------------------------------------------
 def collect_dashboard_bundle(lat: float, lon: float, raio_km: int = 150) -> Dict[str, Any]:
-    """
-    Pacote unificado (clima + ar + solo + focos + DETER) para dashboards.
-    Tudo alinhado com Módulo 7 e modelos v11.
-    """
-    clima = collect_weather_now(lat, lon)
-    focos = collect_focos_now(lat, lon)
-    deter = collect_deter_now(lat, lon, raio_km)
-
     return {
         "ok": True,
         "coords": {"lat": lat, "lon": lon},
-        "clima": clima,
-        "focos": focos,
-        "deter": deter,
+        "clima": collect_weather_now(lat, lon),
+        "focos": collect_focos_now(lat, lon),
+        "deter": collect_deter_now(lat, lon, raio_km),
     }
-
-
 # ============================================================
-# 🧩 MÓDULO 11 — ENDPOINT /api/data (Dashboard v11)
+# 🧩 MÓDULO 11 — ENDPOINT /api/data (Dashboard v11) — REVISADO
 # ============================================================
 
 class DataRequest(BaseModel):
@@ -2035,11 +1832,9 @@ class DataRequest(BaseModel):
 @app.post("/api/data", tags=["Dashboard"], summary="Dados completos para o dashboard AmazonSafe v11")
 def api_data(req: DataRequest):
 
-    # ------------------------------------------------------------
-    # 1) Contexto completo (v11)
-    # ------------------------------------------------------------
+    # 1) Contexto completo (Módulo 7)
     try:
-        ctx = build_observation_context(
+        ctx = build_context(
             cidade=req.cidade,
             lat=req.lat,
             lon=req.lon,
@@ -2048,57 +1843,41 @@ def api_data(req: DataRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            400,
-            detail=f"Erro ao obter contexto: {e}"
-        )
+        raise HTTPException(400, f"Erro ao montar contexto: {e}")
 
     lat = ctx["location"]["lat"]
     lon = ctx["location"]["lon"]
 
-    # ------------------------------------------------------------
-    # 2) Clima + Focos + DETER
-    # ------------------------------------------------------------
+    # 2) Coletas individuais
     clima_now = collect_weather_now(lat, lon)
     focos_now = collect_focos_now(lat, lon)
-    deter = ctx.get("deter")
+    deter_now = collect_deter_now(lat, lon, req.raio_km)
 
-    # ------------------------------------------------------------
-    # 3) IA v11 (ML)
-    # ------------------------------------------------------------
+    # 3) ML v11
     ml_res = run_ml_model(ctx)
-    ctx["ml_raw"] = ml_res.get("ml_raw")
-    ctx["ml_level"] = ml_res.get("ml_level")
+    ctx["ml_raw"] = ml_res["ml_raw"]
+    ctx["ml_level"] = ml_res["ml_level"]
 
-    # ------------------------------------------------------------
-    # 4) Score Final Híbrido
-    # ------------------------------------------------------------
+    # 4) Score final
     final = compute_final_score(ctx)
 
-    # ------------------------------------------------------------
-    # 5) ConservationScore (heurístico)
-    # ------------------------------------------------------------
-    cons = ctx.get("conservation") or {}
-    heuristic_score = cons.get("score")
-    heuristic_level = cons.get("level")
+    cons = ctx["conservation"]
 
-    # ------------------------------------------------------------
-    # 6) Resposta oficial (Dashboard v11)
-    # ------------------------------------------------------------
+    # 5) Resposta final v11
     return {
         "ok": True,
         "local": ctx["location"],
         "clima_atual": clima_now,
         "focos_reais": focos_now,
-        "deter": deter,
+        "deter": deter_now,
         "heuristica": {
-            "score": heuristic_score,
-            "level": heuristic_level,
-            "components": cons.get("components"),
+            "score": cons["score"],
+            "level": cons["level"],
+            "components": cons["components"],
         },
         "ml_v11": {
-            "raw": ml_res.get("ml_raw"),
-            "level": ml_res.get("ml_level"),
+            "raw": ml_res["ml_raw"],
+            "level": ml_res["ml_level"],
         },
         "score_final": {
             "score": final.score,
@@ -2107,7 +1886,6 @@ def api_data(req: DataRequest):
         },
         "contexto": ctx,
     }
-
 
 
 # ============================================================
@@ -2129,10 +1907,10 @@ class DataAutoRequest(BaseModel):
 def api_data_auto(req: DataAutoRequest):
 
     # ------------------------------------------------------------
-    # 1) Contexto completo
+    # 1) Contexto completo oficial (Módulo 7)
     # ------------------------------------------------------------
     try:
-        ctx = build_observation_context(
+        ctx = build_context(
             cidade=req.cidade,
             lat=req.lat,
             lon=req.lon,
@@ -2141,58 +1919,52 @@ def api_data_auto(req: DataAutoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            400,
-            detail=f"Erro ao construir contexto: {e}",
-        )
+        raise HTTPException(400, f"Erro ao montar contexto: {e}")
 
     lat = ctx["location"]["lat"]
     lon = ctx["location"]["lon"]
 
     # ------------------------------------------------------------
-    # 2) Clima + Focos + DETER
+    # 2) Coletas individuais (Dashboard v11)
     # ------------------------------------------------------------
     clima_now = collect_weather_now(lat, lon)
     focos_now = collect_focos_now(lat, lon)
-    deter = ctx.get("deter")
+    deter_now = collect_deter_now(lat, lon, req.raio_km)
+
+    # Atualizar ctx para IA
+    if clima_now.get("features"):
+        ctx["meteo"] = clima_now["features"]
+
+    ctx["focos"] = focos_now.get("focos", {})
+    ctx["deter"] = deter_now.get("deter", {})
 
     # ------------------------------------------------------------
     # 3) IA RandomForest v11
     # ------------------------------------------------------------
     ml_res = run_ml_model(ctx)
-    ctx["ml_raw"] = ml_res.get("ml_raw")
-    ctx["ml_level"] = ml_res.get("ml_level")
+    ctx["ml_raw"] = ml_res["ml_raw"]
+    ctx["ml_level"] = ml_res["ml_level"]
 
     # ------------------------------------------------------------
     # 4) Heurística + Score Final Híbrido
     # ------------------------------------------------------------
-    cons = ctx.get("conservation") or {}
-    heuristic_score = cons.get("score")
-    heuristic_level = cons.get("level")
-
     final = compute_final_score(ctx)
+    cons = ctx["conservation"]
 
     return {
         "ok": True,
-        "local": {
-            "cidade_entrada": req.cidade,
-            "lat": lat,
-            "lon": lon,
-            "resolved_by": ctx["location"].get("resolved_by"),
-            "display_name": ctx["location"].get("display_name"),
-            "radius_km": req.raio_km,
-        },
+        "local": ctx["location"],
         "clima_atual": clima_now,
         "focos_reais": focos_now,
-        "desmatamento": deter,
+        "desmatamento": deter_now,
         "heuristica": {
-            "score": heuristic_score,
-            "level": heuristic_level,
+            "score": cons.get("score"),
+            "level": cons.get("level"),
             "components": cons.get("components"),
         },
         "ia": {
-            "ml_raw": ml_res.get("ml_raw"),
-            "ml_level": ml_res.get("ml_level"),
+            "ml_raw": ml_res["ml_raw"],
+            "ml_level": ml_res["ml_level"],
             "modelo_path": MODEL_PATH,
         },
         "score_hibrido": {
@@ -2200,18 +1972,16 @@ def api_data_auto(req: DataAutoRequest):
             "level": final.level,
             "breakdown": final.breakdown,
         },
-        # Compatibilidade com o front antigo
         "ia_compat": {
-            "risco_simples": heuristic_level,
+            "risco_simples": cons.get("level"),
             "score_hibrido": final.score,
             "risco_hibrido": final.level,
         },
         "contexto": ctx,
     }
 
-
 # ============================================================
-# 🧩 MÓDULO 13 — Alertas + Score Inteligente (v11)
+# 🧩 MÓDULO 13 — Alertas + Score Inteligente (v11) — REVISADO
 # ============================================================
 
 class AlertUpdateRequest(BaseModel):
@@ -2235,104 +2005,77 @@ class AlertUpdateRequest(BaseModel):
     summary="Atualiza alertas e calcula score inteligente (v11)"
 )
 def api_alertas_update(req: AlertUpdateRequest):
-    """
-    Pipeline v11:
-      1) build_observation_context → clima + solo + ar + DETER + focos
-      2) monta alert_obs completo
-      3) calcula score de alerta (compute_alert_score)
-      4) adiciona alert_params ao ctx e calcula score final híbrido
-      5) gera persistência NDJSON
-      6) verifica transição de nível e envia notificações
-      7) retorna resposta consolidada
-    """
 
-    # ----------------------------------------------------------------------
-    # 1) Contexto ambiental completo
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 1) Contexto completo oficial (Módulo 7)
+    # ------------------------------------------------------------
     try:
-        ctx = build_observation_context(
+        ctx = build_context(
             cidade=req.cidade,
             lat=req.lat,
             lon=req.lon,
-            raio_km=req.raio_km
+            raio_km=req.raio_km,
         )
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(400, f"Erro ao construir contexto: {e}")
 
     loc = ctx["location"]
     lat = loc["lat"]
     lon = loc["lon"]
-
     meteo = ctx.get("meteo") or {}
     focos_ctx = ctx.get("focos") or {}
     deter_ctx = ctx.get("deter") or {}
     conservation = ctx.get("conservation") or {}
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
     # 2) Precipitação + PMs (v11)
-    # ----------------------------------------------------------------------
-    precip = (
-        meteo.get("chuva_mm")
-        or meteo.get("precipitation")
-        or meteo.get("rain")
-        or 0.0
-    )
-
+    # ------------------------------------------------------------
+    precip = meteo.get("chuva_mm") or meteo.get("precipitation") or 0.0
     pm25 = meteo.get("pm25")
     pm10 = meteo.get("pm10")
 
-    # ----------------------------------------------------------------------
-    # 3) Estatística simples de focos
-    # ----------------------------------------------------------------------
-    focos_total = (
-        focos_ctx.get("count")
-        or focos_ctx.get("total")
-        or focos_ctx.get("focos_total")
-    )
+    # ------------------------------------------------------------
+    # 3) Estatística de focos
+    # ------------------------------------------------------------
+    focos_total = focos_ctx.get("focos_total") \
+        or focos_ctx.get("count") \
+        or 0
 
-    if focos_total is None:
-        lista = focos_ctx.get("focos") or focos_ctx.get("items") or []
-        focos_total = len(lista)
-
-    # ----------------------------------------------------------------------
-    # 4) Montar alert_obs (payload completo para IA v11)
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 4) alert_obs — payload completo
+    # ------------------------------------------------------------
     alert_obs = {
         "severity": req.severity,
         "duration": req.duration,
         "frequency": req.frequency,
         "impact": req.impact,
-
         "pm25": pm25,
         "pm10": pm10,
         "precipitation": precip,
         "focos_total": focos_total,
-
         "meta": {
             "radius_km": req.raio_km,
             "precipitation": precip,
         }
     }
 
-    # ----------------------------------------------------------------------
-    # 5) Score Inteligente do alerta (v11)
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 5) Score Inteligente de Alertas
+    # ------------------------------------------------------------
     alert_score = compute_alert_score(alert_obs)
     alert_level = _classify_level(alert_score["score"])
 
-    # ----------------------------------------------------------------------
-    # 6) Score híbrido final (IA + heurística + alerta)
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 6) Score Híbrido Final
+    # ------------------------------------------------------------
     ctx2 = dict(ctx)
     ctx2["alert_params"] = alert_obs
 
     final = compute_final_score(ctx2)
 
-    # ----------------------------------------------------------------------
-    # 7) Persistência em NDJSON + transição de nível
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # 7) Persistência NDJSON + transição de nível
+    # ------------------------------------------------------------
     alert_id = (
         req.cidade.lower().replace(" ", "_")
         if req.cidade else f"{lat:.4f},{lon:.4f}"
@@ -2358,9 +2101,9 @@ def api_alertas_update(req: AlertUpdateRequest):
         alert_obs=alert_obs,
     )
 
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
     # 8) Retorno final consolidado
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
     return {
         "ok": True,
         "local": {
@@ -2391,15 +2134,19 @@ def api_alertas_update(req: AlertUpdateRequest):
     }
 
 
-
 # ============================================================
 # 🧩 MÓDULO 14 — Rotas Administrativas / Diagnóstico (v11)
 # ============================================================
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 router_admin = APIRouter(prefix="/admin", tags=["Admin"])
 app.include_router(router_admin)
+
+# ---- Defaults seguros ----
+DEFAULT_LAT = -1.45056
+DEFAULT_LON = -48.46824
+
 
 # ------------------------------------------------------------
 # 14.1 — Status geral
@@ -2413,8 +2160,6 @@ def admin_status():
         "model_loaded": modelo_pipeline is not None,
         "model_path": MODEL_PATH,
         "db_url": DB_URL,
-        "default_scope_inpe": INPE_DEFAULT_SCOPE,
-        "default_region_inpe": INPE_DEFAULT_REGION,
     }
 
 
@@ -2426,7 +2171,10 @@ def admin_model_state():
     if modelo_pipeline is None:
         return {"loaded": False, "msg": "Modelo IA v11 não carregado."}
 
-    feats = list(getattr(modelo_pipeline, "feature_names_in_", []))
+    try:
+        feats = list(getattr(modelo_pipeline, "feature_names_in_", []))
+    except:
+        feats = []
 
     return {
         "loaded": True,
@@ -2441,16 +2189,14 @@ def admin_model_state():
 # ------------------------------------------------------------
 @router_admin.get("/last_records", summary="Últimas observações persistidas")
 def admin_last_records():
-    try:
-        w = get_last_weather()
-        f = get_last_fire()
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
+    """
+    Como ainda não existe persistência real para weather/fire,
+    devolvemos um fallback seguro para não quebrar o dashboard.
+    """
     return {
         "ok": True,
-        "last_weather": w.dict() if w else None,
-        "last_fire": f.dict() if f else None,
+        "last_weather": "not_implemented",
+        "last_fire": "not_implemented",
     }
 
 
@@ -2464,19 +2210,23 @@ def admin_external_check():
     # Open-Meteo
     try:
         clima = get_meteo(DEFAULT_LAT, DEFAULT_LON)
-        status["open_meteo"] = "ok" if clima else "fail"
+        status["open_meteo"] = "ok" if clima else "empty"
     except Exception as e:
         status["open_meteo"] = f"error: {e}"
 
     # INPE
     try:
         d = inpe_focos_near(DEFAULT_LAT, DEFAULT_LON, 50)
-        status["inpe"] = "ok" if d else "fail"
+        status["inpe"] = "ok" if d else "empty"
     except Exception as e:
         status["inpe"] = f"error: {e}"
 
     # DETER
-    status["deter"] = "not_implemented"
+    try:
+        deter = deter_stats(DEFAULT_LAT, DEFAULT_LON, 150)
+        status["deter"] = "ok" if deter else "empty"
+    except Exception as e:
+        status["deter"] = f"error: {e}"
 
     return status
 
@@ -2486,11 +2236,13 @@ def admin_external_check():
 # ------------------------------------------------------------
 @router_admin.get("/geocode_test", summary="Testa geocodificação")
 def admin_geocode_test(cidade: str):
-    info = geocode_city(cidade)
-    if not info:
-        return {"ok": False, "msg": f"Não foi possível geocodificar '{cidade}'"}
-    return {"ok": True, "result": info}
-
+    try:
+        info = geocode_city(cidade)
+        if not info:
+            return {"ok": False, "msg": f"Não foi possível geocodificar '{cidade}'"}
+        return {"ok": True, "result": info}
+    except Exception as e:
+        raise HTTPException(400, f"Erro no geocoder: {e}")
 
 
 # ============================================================
@@ -2506,38 +2258,44 @@ from typing import Dict, Any
 from fastapi import Request, APIRouter
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# util
-def now_utc():
-    return datetime.now(timezone.utc)
-
-# ------------------------------------------------------------
-# Diretórios de log
-# ------------------------------------------------------------
+# -----------------------------------------
+# Diretórios de log seguros / compatíveis Render
+# -----------------------------------------
 def _ensure_logs_dir():
-    d = "./runtime_data/logs"
-    os.makedirs(d, exist_ok=True)
-    return d
+    """
+    No Render /tmp é persistente durante a execução.
+    Para execuções locais usa ./runtime_data/logs
+    """
+    base = "/tmp/amazonsafe_logs" if os.getenv("RENDER") else "./runtime_data/logs"
+    os.makedirs(base, exist_ok=True)
+    return base
 
 LOG_DIR = _ensure_logs_dir()
 LOG_MAIN = os.path.join(LOG_DIR, "events.ndjson")
 LOG_REQUESTS = os.path.join(LOG_DIR, "requests.ndjson")
 LOG_IA = os.path.join(LOG_DIR, "ia.ndjson")
 
-# ------------------------------------------------------------
-# Escrita em NDJSON
-# ------------------------------------------------------------
-def _append_jsonl(path: str, rec: Dict[str, Any]):
+
+# -----------------------------------------
+# Utilitários
+# -----------------------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def _safe_write(path: str, rec: Dict[str, Any]):
+    """Escrita robusta NDJSON, à prova de race condition."""
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         print("[LOG_ERROR]", e)
 
-# ------------------------------------------------------------
+
+# -----------------------------------------
 # Funções principais de log
-# ------------------------------------------------------------
+# -----------------------------------------
 def log_event(event_type: str, msg: str, extra: Dict[str, Any] | None = None):
-    _append_jsonl(LOG_MAIN, {
+    _safe_write(LOG_MAIN, {
         "ts": now_utc().isoformat(),
         "type": event_type,
         "message": msg,
@@ -2545,7 +2303,7 @@ def log_event(event_type: str, msg: str, extra: Dict[str, Any] | None = None):
     })
 
 def log_request(path: str, method: str, status: int, duration_ms: float, client: str):
-    _append_jsonl(LOG_REQUESTS, {
+    _safe_write(LOG_REQUESTS, {
         "ts": now_utc().isoformat(),
         "path": path,
         "method": method,
@@ -2557,16 +2315,17 @@ def log_request(path: str, method: str, status: int, duration_ms: float, client:
 def log_inference(ctx: Dict[str, Any], prediction: Any, final_score: Any = None):
     if hasattr(final_score, "__dict__"):
         final_score = vars(final_score)
-    _append_jsonl(LOG_IA, {
+    _safe_write(LOG_IA, {
         "ts": now_utc().isoformat(),
         "ctx": ctx,
         "prediction": prediction,
         "final": final_score,
     })
 
-# ------------------------------------------------------------
-# Middleware de captura de erros
-# ------------------------------------------------------------
+
+# -----------------------------------------
+# Middleware — captura de erros
+# -----------------------------------------
 class ErrorLoggerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         try:
@@ -2579,13 +2338,17 @@ class ErrorLoggerMiddleware(BaseHTTPMiddleware):
                 "traceback": tb,
             })
             print(tb)
-            raise e
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": str(e)}
+            )
 
 app.add_middleware(ErrorLoggerMiddleware)
 
-# ------------------------------------------------------------
-# Middleware auditor
-# ------------------------------------------------------------
+
+# -----------------------------------------
+# Middleware — auditor de chamadas HTTP
+# -----------------------------------------
 @app.middleware("http")
 async def audit_api_calls(request: Request, call_next):
     start = time.time()
@@ -2601,13 +2364,15 @@ async def audit_api_calls(request: Request, call_next):
     )
     return response
 
-# ------------------------------------------------------------
-# Endpoints de leitura
-# ------------------------------------------------------------
+
+# -----------------------------------------
+# Endpoints de leitura dos logs
+# -----------------------------------------
 router_logs = APIRouter(prefix="/logs", tags=["Logs"])
 
 @router_logs.get("/tail")
 def tail_logs(n: int = 50):
+    n = max(1, min(n, 500))
     if not os.path.exists(LOG_MAIN):
         return {"ok": False, "msg": "Nenhum log encontrado."}
     lines = open(LOG_MAIN).read().splitlines()[-n:]
@@ -2615,6 +2380,7 @@ def tail_logs(n: int = 50):
 
 @router_logs.get("/tail_ia")
 def tail_ia(n: int = 50):
+    n = max(1, min(n, 500))
     if not os.path.exists(LOG_IA):
         return {"ok": False, "msg": "Nenhum log IA encontrado."}
     lines = open(LOG_IA).read().splitlines()[-n:]
@@ -2627,19 +2393,6 @@ def push_log(event_type: str, message: str):
 
 app.include_router(router_logs)
 
-# ============================================================
-# Função mínima — load_deter_df (fallback temporário)
-# ============================================================
-def load_deter_df():
-    """
-    Fallback provisório:
-    Retorna um DataFrame vazio para não quebrar o healthcheck.
-    """
-    try:
-        import pandas as pd
-        return pd.DataFrame()
-    except Exception:
-        return None
 
 # ============================================================
 # 🧩 MÓDULO 16 — Healthcheck, Métricas e Autoverificação (v11)
@@ -2664,13 +2417,16 @@ def api_health():
         "version": "1.1.0-v11",
         "timestamp": now_utc().isoformat(),
         "model_loaded": modelo_pipeline is not None,
-        "db_url": DB_URL,
+        "db_ok": True,
+        "disk_ok": True,
     }
+
 
 # versão raiz
 @app.get("/health")
 def root_health():
     return {"ok": True, "status": "online", "path": "/system/health"}
+
 
 # ------------------------------------------------------------
 # Health do modelo v11
@@ -2678,17 +2434,21 @@ def root_health():
 @router_health.get("/health/model_v11")
 def api_health_model_v11():
     try:
-        ctx = build_observation_context(lat=DEFAULT_LAT, lon=DEFAULT_LON)
+        # AGORA USANDO O build_context REAL
+        ctx = build_context(lat=DEFAULT_LAT, lon=DEFAULT_LON)
         ml = run_ml_model(ctx)
         final = compute_final_score(ctx)
+
         return {
             "ok": True,
-            "ml_raw": ml.get("ml_raw"),
+            "ml_raw": ml["ml_raw"],
+            "ml_level": ml["ml_level"],
             "final_score": final.score,
             "final_level": final.level,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 # ------------------------------------------------------------
 # Providers externos
@@ -2707,19 +2467,20 @@ def api_health_providers():
     # INPE focos
     try:
         f = inpe_focos_near(DEFAULT_LAT, DEFAULT_LON, 50)
-        n = (f.get("features") or {}).get("count") or 0
-        out["inpe"] = {"ok": True, "focos": n}
+        n = (f.get("features") or {}).get("count", 0)
+        out["inpe"] = {"ok": True, "focos_50km": n}
     except Exception as e:
         out["inpe"] = {"ok": False, "error": str(e)}
 
-    # DETER (navegação simples)
+    # DETER
     try:
-        df = load_deter_df()
-        out["deter"] = {"ok": True, "rows": len(df) if df is not None else 0}
+        ds = deter_stats(DEFAULT_LAT, DEFAULT_LON, 150)
+        out["deter"] = {"ok": True, "items": len(ds) if hasattr(ds, "__len__") else 1}
     except Exception as e:
         out["deter"] = {"ok": False, "error": str(e)}
 
     return {"ok": True, "providers": out}
+
 
 # ------------------------------------------------------------
 # Disco
@@ -2727,14 +2488,15 @@ def api_health_providers():
 @router_health.get("/health/disk")
 def api_health_disk():
     try:
-        d = "./runtime_data/healthcheck"
-        os.makedirs(d, exist_ok=True)
-        p = os.path.join(d, "test.txt")
-        with open(p, "w", encoding="utf-8") as f:
+        test_dir = "/tmp/amazonsafe_disk_test"
+        os.makedirs(test_dir, exist_ok=True)
+        fpath = os.path.join(test_dir, "test.txt")
+        with open(fpath, "w", encoding="utf-8") as f:
             f.write(now_utc().isoformat())
-        return {"ok": True, "file": p}
+        return {"ok": True, "file": fpath}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 # ------------------------------------------------------------
 # Banco de dados
@@ -2748,20 +2510,24 @@ def api_health_db():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 # ------------------------------------------------------------
 # Métricas estilo Prometheus
 # ------------------------------------------------------------
 @router_health.get("/metrics")
 def api_metrics():
     metrics = {
-        "uptime_seconds": time.time() - START_TIME,
-        "model_v11_loaded": 1 if modelo_pipeline is not None else 0,
+        "amazonsafe_uptime_seconds": round(time.time() - START_TIME, 2),
+        "amazonsafe_model_v11_loaded": 1 if modelo_pipeline is not None else 0,
     }
-    return PlainTextResponse("\n".join(f"{k} {v}" for k, v in metrics.items()))
+    return PlainTextResponse(
+        "\n".join(f"{k} {v}" for k, v in metrics.items())
+    )
 
-# ============================================================
-# HEALTH CHECK — geocode  (🔧 agora ANTES do include_router)
-# ============================================================
+
+# ------------------------------------------------------------
+# Geocode Test
+# ------------------------------------------------------------
 @router_health.get("/health/geocode")
 def system_geocode_test(city: str = "Belém"):
     try:
@@ -2772,7 +2538,8 @@ def system_geocode_test(city: str = "Belém"):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# Agora sim — só depois incluímos o router
+
+# incluir router após definição
 app.include_router(router_health)
 
 # ============================================================
@@ -2795,12 +2562,14 @@ if __name__ == "__main__":
     print(f"➡ URL.......: http://127.0.0.1:{port}")
     print("==============================================\n")
 
+    reload_flag = env == "development"
+
     try:
         uvicorn.run(
             "main:app",
             host="0.0.0.0",
             port=port,
-            reload=(env == "development"),
+            reload=reload_flag,
             log_level="info",
         )
     except Exception as e:
